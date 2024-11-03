@@ -1,4 +1,5 @@
-from ..reader import Reader, Model, Vertex, Triangle
+from ..reader import Reader
+from utils.types import *
 import pywavefront
 
 

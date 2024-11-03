@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from .types import *
+from utils.types import *
 
 
 class Reader(ABC):

@@ -22,10 +22,24 @@ class Vertex:
         return Vertex(self.x * scalar, self.y * scalar, self.z * scalar)
 
     # Division (by scalar)
-    def __truediv__(self, scalar: float) -> 'Vertex':
+    def truediv_by_scalar(self, scalar: float) -> 'Vertex':
         if scalar == 0:
             raise ValueError("Cannot divide by zero.")
         return Vertex(self.x / scalar, self.y / scalar, self.z / scalar)
+
+    # Division (by vertex)
+    def truediv_by_vertex(self, other: 'Vertex') -> 'Vertex':
+        if (other.x == 0) or (other.y == 0) or (other.z == 0):
+            raise ValueError("Cannot divide by zero.")
+        return Vertex(self.x / other.x, self.y / other.y, self.z / other.z)
+
+    # Division
+    def __truediv__(self, other: Union[float, 'Vertex']) -> 'Vertex':
+        if type(other) == float:
+            return self.truediv_by_scalar(other)
+        elif type(other) == type(self):
+            return self.truediv_by_vertex(other)
+        raise TypeError("Provided type is not supported.")
 
     # Equality
     def __eq__(self, other: 'Vertex') -> bool:
@@ -145,3 +159,8 @@ class Model:
             aabb.max.z = max(vertex.z, aabb.max.z)
 
         return aabb
+
+
+@dataclass
+class CompressedModel:
+    data: bytes
