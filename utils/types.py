@@ -164,3 +164,5 @@ class Model:
 @dataclass
 class CompressedModel:
     data: bytes
+    bits_per_vertex: float
+    bits_per_triangle: float
