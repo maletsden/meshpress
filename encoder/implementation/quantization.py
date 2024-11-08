@@ -158,7 +158,7 @@ class SimpleQuantizator(Encoder):
                 for index in triangle_strip:
                     byte_array.extend(struct.pack('I', index))
             case Packing.FIXED:
-                extend_bytearray_with_fixed_size_values(byte_array, int(np.log2(len(model.vertices))), triangle_strip)
+                extend_bytearray_with_fixed_size_values(byte_array,int(np.ceil(np.log2(len(model.vertices)))), triangle_strip)
             case Packing.BINARY_RANGE_PARTITIONING:
                 codes = calculate_codes_using_binary_range_partitioning(len(model.vertices))
                 bit_codes = [codes[v] for v in triangle_strip]

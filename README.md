@@ -27,9 +27,9 @@ The following table summarizes the statistics for each compression model:
 |---------------------------------------------------|--------------------|------------------|------------------|
 | **BaselineEncoder**                               | 18.05              | 35.82            | 1.00             |
 | **SimpleQuantizator (no packing)**                | 11.60              | 23.03            | 1.56             | 
-| **SimpleQuantizator (fixed packing)**             | **5.53**           | **10.98**        | **3.26**         | 
+| **SimpleQuantizator (fixed packing)**             | 5.77               | 11.46            | 3.12             | 
 | **SimpleQuantizator (binary range partitioning)** | 5.69               | 11.29            | 3.17             |
-| **SimpleQuantizator (radix binary tree)**         | 5.59               | 11.09            | 3.22             | 
+| **SimpleQuantizator (radix binary tree)**         | **5.59**           | **11.09**        | **3.22**         | 
 
 Each encoder model applies a different strategy for compressing 3D mesh data, allowing users to balance compression rate and computational complexity according to their needs.
 
