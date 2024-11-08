@@ -23,13 +23,15 @@ pip install -r requirements.txt
 The following table summarizes the statistics for each compression model:
 
 
-| Encoder Model                                     | Bytes per triangle | Bytes per vertex | Compression rate | 
-|---------------------------------------------------|--------------------|------------------|------------------|
-| **BaselineEncoder**                               | 18.05              | 35.82            | 1.00             |
-| **SimpleQuantizator (no packing)**                | 11.60              | 23.03            | 1.56             | 
-| **SimpleQuantizator (fixed packing)**             | 5.77               | 11.46            | 3.12             | 
-| **SimpleQuantizator (binary range partitioning)** | 5.69               | 11.29            | 3.17             |
-| **SimpleQuantizator (radix binary tree)**         | **5.59**           | **11.09**        | **3.22**         | 
+| Encoder Model                                                 | Bytes per triangle | Bytes per vertex | Compression rate | 
+|---------------------------------------------------------------|--------------------|------------------|------------------|
+| **BaselineEncoder**                                           | 18.05              | 35.82            | 1.00             |
+| **SimpleQuantizator (no packing)**                            | 11.60              | 23.03            | 1.56             | 
+| **SimpleQuantizator (fixed packing)**                         | 5.77               | 11.46            | 3.12             | 
+| **SimpleQuantizator (binary range partitioning)**             | 5.69               | 11.29            | 3.17             |
+| **SimpleQuantizator (radix binary tree)**                     | 5.59               | 11.09            | 3.22             | 
+| **SimpleQuantizator (binary range partitioning, reordered)**  | 5.62               | 11.15            | 3.21             |
+| **SimpleQuantizator (radix binary tree, reordered)**          | **5.54**           | **11.00**        | **3.25**         | 
 
 Each encoder model applies a different strategy for compressing 3D mesh data, allowing users to balance compression rate and computational complexity according to their needs.
 

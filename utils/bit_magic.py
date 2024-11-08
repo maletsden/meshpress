@@ -1,5 +1,11 @@
 from typing import List, Generator
 import numpy as np
+from collections import Counter
+
+
+def calculate_entropy(data: List[int]) -> float:
+    frequencies = Counter(data)
+    return float(-sum(map(lambda f: f / len(data) * np.log2(f / len(data)), frequencies.values())))
 
 
 def extend_bytearray_with_12bit_values(byte_array: bytearray, values: List[int]):
@@ -60,12 +66,12 @@ def calculate_codes_using_binary_range_partitioning(number):
             return []
 
         number = number_ranges[-1][1]
-        codes = [None] * number
+        codes = [None] * (number + 1)
         max_bits = int(np.ceil(np.log2(number)))
 
         for numbers_range in number_ranges:
             range_start, range_end, bits_needed = numbers_range
-            for i in range(range_start, range_end):
+            for i in range(range_start, range_end + (range_end == number)):
                 prefix_length = (max_bits - bits_needed)
                 codes[i] = "1" * prefix_length + bin(i - range_start)[2:].rjust(bits_needed - prefix_length, '0')
         return codes
@@ -77,7 +83,7 @@ def calculate_codes_using_binary_range_partitioning(number):
 
 
 def calculate_codes_using_binary_radix_tree(number):
-    numbers_list = list(range(0, number))
+    numbers_list = list(range(0, number + 1))
     codes = [""] * len(numbers_list)
 
     def split_list(numbers_list, mask):
