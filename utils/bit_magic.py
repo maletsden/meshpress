@@ -1,6 +1,7 @@
 from typing import List, Generator
 import numpy as np
 from collections import Counter
+from .types import Vertex, AABB
 
 
 def calculate_entropy(data: List[int]) -> float:
@@ -105,3 +106,17 @@ def calculate_codes_using_binary_radix_tree(number):
 
     calculate_codes_for_number_impl(numbers_list)
     return codes
+
+
+def quantize_vertices(vertices: List[Vertex], aabb: AABB, used_bits: int) -> List[int]:
+    assert used_bits < 32
+
+    data = [0] * (len(vertices) * 3)
+
+    for i in range(len(vertices)):
+        quantized_vertex = (vertices[i] - aabb.min) / (aabb.max - aabb.min)
+        data[i * 3 + 0] = np.uint32(quantized_vertex.x * (2 ** used_bits - 1))
+        data[i * 3 + 1] = np.uint32(quantized_vertex.y * (2 ** used_bits - 1))
+        data[i * 3 + 2] = np.uint32(quantized_vertex.z * (2 ** used_bits - 1))
+
+    return data
