@@ -33,9 +33,13 @@ The following table summarizes the statistics for each compression model:
 | **SimpleQuantizator (binary range partitioning, reordered)** | 5.62               | 11.15            | 3.21             |
 | **SimpleQuantizator (radix binary tree, reordered)**         | 5.54               | 11.00            | 3.26             | 
 | **GTSQuantizator (fixed packing)**                           | 4.82               | 9.57             | 3.74             |
-| **GTSQuantizator (radix binary tree)**                       | **4.70**           | **9.32**         | **3.84**         | 
+| **GTSQuantizator (radix binary tree)**                       | 4.70               | 9.32             | 3.84             | 
+| **PackedGTSQuantizator (fixed packing)**                     | 4.26               | 8.46             | 4.23             |
+| **PackedGTSQuantizator (radix binary tree)**                 | **4.18**           | **8.29**         | **4.32**         | 
 
 Each encoder model applies a different strategy for compressing 3D mesh data, allowing users to balance compression rate and computational complexity according to their needs.
+
+![bytes_per_triangle_bar_plot](images/bytes_per_triangle_bar_plot.png) ![compression_rate_bar_plot](images/compression_rate_bar_plot.png)
 
 ## License
 
@@ -44,3 +48,4 @@ This project is licensed under the MIT License. See the `LICENSE` file for detai
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request if you have improvements or suggestions.
+
