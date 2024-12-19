@@ -36,6 +36,10 @@ The following table summarizes the statistics for each compression model:
 | **GTSQuantizator (radix binary tree)**                       | 4.70               | 9.32             | 3.84             | 
 | **PackedGTSQuantizator (fixed packing)**                     | 4.26               | 8.46             | 4.23             |
 | **PackedGTSQuantizator (radix binary tree)**                 | **4.18**           | **8.29**         | **4.32**         | 
+| **GTSParallelogramPredictor (Huffman encoder)**              | 4.94               | 9.81             | 3.65             |
+| **GTSParallelogramPredictor (adaptive Huffman encoder)**     | 4.92               | 9.77             | 3.67             |
+| **GTSParallelogramPredictor (arithmetic encoder)**           | 4.92               | 9.77             | 3.67             |
+| **GTSParallelogramPredictor (adaptive arithmetic encoder)**  | 4.90               | 9.73             | 3.68             |
 
 Each encoder model applies a different strategy for compressing 3D mesh data, allowing users to balance compression rate and computational complexity according to their needs.
 

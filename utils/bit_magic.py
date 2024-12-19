@@ -28,14 +28,18 @@ def extend_bytearray_with_12bit_values(byte_array: bytearray, values: List[int])
 
 def extend_bytearray_with_bit_codes(byte_array: bytearray, bit_codes: List[str]) -> None:
     # Initialize a binary string to accumulate bits
-    binary_string = ''.join(bit_codes)
+    bitstream = ''.join(bit_codes)
 
+    extend_bytearray_with_bitstream(byte_array, bitstream)
+
+
+def extend_bytearray_with_bitstream(byte_array: bytearray, bitstream: str) -> None:
     # Make sure the binary string length is a multiple of 8 by padding with zeros if necessary
-    padding_length = (8 - len(binary_string) % 8) % 8
-    binary_string += '0' * padding_length
+    padding_length = (8 - len(bitstream) % 8) % 8
+    bitstream += '0' * padding_length
 
     # Convert the binary string to a bytearray
-    byte_array.extend(int(binary_string[i:i + 8], 2) for i in range(0, len(binary_string), 8))
+    byte_array.extend(int(bitstream[i:i + 8], 2) for i in range(0, len(bitstream), 8))
 
 
 def extend_bytearray_with_fixed_size_values(byte_array: bytearray, size: int, values: List[int]) -> None:
@@ -120,3 +124,24 @@ def quantize_vertices(vertices: List[Vertex], aabb: AABB, used_bits: int) -> Lis
         data[i * 3 + 2] = np.uint32(quantized_vertex.z * (2 ** used_bits - 1))
 
     return data
+
+# def encode_array_of_unique_values(array: List[int]) -> List[str]:
+#     N = len(array)
+#
+#     assert (np.min(array) == 0)
+#     assert (np.max(array) == N - 1)
+#     assert (len(np.unique(array)) == N)
+#
+#     encoded_codes = ["" for _ in range(N)]
+#
+#     used_values_buffer = np.array([0 for _ in range(len(array))])
+#     for i, v in enumerate(array):
+#         new_v = v - np.sum(used_values_buffer[:v])
+#
+#         codes = calculate_codes_using_binary_radix_tree(N - i)
+#
+#         encoded_codes[i] = codes[new_v]
+#
+#         used_values_buffer[v] = 1
+#
+#     return encoded_codes

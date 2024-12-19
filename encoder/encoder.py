@@ -9,6 +9,7 @@ class Packing(IntEnum):
     BINARY_RANGE_PARTITIONING = 2
     RADIX_BINARY_TREE = 3
     HUFFMAN_ENCODER = 4
+    ARITHMETIC_ENCODER = 5
 
 
 class Encoder(ABC):

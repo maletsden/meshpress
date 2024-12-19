@@ -2,8 +2,7 @@ from utils.types import *
 from ..encoder import Encoder, Packing
 import struct
 from utils.bit_magic import *
-from utils.huffman_encoder import *
-from utils.geometry import triangle_list_to_strip, triangle_strip_to_list
+from utils.geometry import triangle_list_to_strip
 
 import numpy as np
 from collections import Counter
@@ -92,15 +91,6 @@ class SimpleQuantizator(Encoder):
                     vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, indices_remapping)
 
                 bit_codes = [codes[v] for v in triangle_strip]
-                extend_bytearray_with_bit_codes(byte_array, bit_codes)
-
-            case Packing.HUFFMAN_ENCODER:
-                frequencies, huffman_codes = calculate_huffman_codes(triangle_strip)
-                huffman_codes_array = [(huffman_codes[i] if i in huffman_codes else "0") for i in
-                                       range(len(model.vertices))]
-                extend_bytearray_with_bit_codes(byte_array, huffman_codes_array)
-
-                bit_codes = [huffman_codes_array[v] for v in triangle_strip]
                 extend_bytearray_with_bit_codes(byte_array, bit_codes)
 
         if self.verbose:

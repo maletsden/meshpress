@@ -126,15 +126,18 @@ class PackedGTSQuantizator(Encoder):
 
         reorder_map = calculate_reorder_map()
 
-        vertices, triangle_list = reorder_vertices(vertices, triangle_strip, reorder_map)
+        vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, reorder_map)
 
+        self.triangle_strip = triangle_strip
+        self.strip_side_bits = strip_side_bits
+        self.vertices = vertices
         def calculate_reuse_and_increment_buffers():
             reuse_buffer = []
-            used_buffer = {triangle_list[0]}
+            used_buffer = {triangle_strip[0]}
             increment_flag_buffer = [1]
 
-            for i in range(1, len(triangle_list)):
-                current_vertex = triangle_list[i]
+            for i in range(1, len(triangle_strip)):
+                current_vertex = triangle_strip[i]
 
                 if current_vertex in used_buffer:
                     reuse_buffer.append(current_vertex)
