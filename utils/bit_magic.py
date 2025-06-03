@@ -1,4 +1,4 @@
-from typing import List, Generator
+from typing import List, Generator, Union
 import numpy as np
 from collections import Counter
 from .types import Vertex, AABB
@@ -112,16 +112,18 @@ def calculate_codes_using_binary_radix_tree(number):
     return codes
 
 
-def quantize_vertices(vertices: List[Vertex], aabb: AABB, used_bits: int) -> List[int]:
-    assert used_bits < 32
+def quantize_vertices(vertices: List[Vertex], aabb: AABB, used_bits: Union[int|tuple[int, int, int]]) -> List[int]:
+    if type(used_bits) is int:
+        used_bits = (used_bits, used_bits, used_bits)
+    assert used_bits[0] < 32 and used_bits[1] < 32 and used_bits[2] < 32
 
     data = [0] * (len(vertices) * 3)
 
     for i in range(len(vertices)):
         quantized_vertex = (vertices[i] - aabb.min) / (aabb.max - aabb.min)
-        data[i * 3 + 0] = np.uint32(quantized_vertex.x * (2 ** used_bits - 1))
-        data[i * 3 + 1] = np.uint32(quantized_vertex.y * (2 ** used_bits - 1))
-        data[i * 3 + 2] = np.uint32(quantized_vertex.z * (2 ** used_bits - 1))
+        data[i * 3 + 0] = np.uint32(quantized_vertex.x * (2 ** used_bits[0] - 1))
+        data[i * 3 + 1] = np.uint32(quantized_vertex.y * (2 ** used_bits[1] - 1))
+        data[i * 3 + 2] = np.uint32(quantized_vertex.z * (2 ** used_bits[2] - 1))
 
     return data
 
