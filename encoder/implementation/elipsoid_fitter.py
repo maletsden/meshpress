@@ -3,11 +3,13 @@ from ..encoder import Encoder, Packing
 import struct
 from utils.bit_magic import *
 from utils.geometry import triangle_list_to_strip
+from utils.geometry import triangle_list_to_generalized_strip, generalized_strip_to_triangle_list, reorder_vertices
 
 import numpy as np
 from collections import Counter
 import torch
 import math
+from abc import ABC, abstractmethod
 
 
 def calculate_remapping(strip, codes):
@@ -28,15 +30,25 @@ def calculate_remapping(strip, codes):
     return indices_remap
 
 
-def reorder_vertices(vertices, triangle_strip, indices_remap):
-    indices_remapping_inverse = {new: old for old, new in indices_remap.items()}
-    reordered_vertices = [vertices[indices_remapping_inverse[i]] for i in range(len(vertices))]
-    reordered_triangle_strip = [indices_remap[v] for v in triangle_strip]
+class EllipsoidNode:
+    """
+    Node for hierarchical ellipsoid fit.
+    Attributes:
+      center:   (3,) fitted center
+      axes:     (3,) fitted semi‐axes
+      residuals:(N_subset, 3) residual vectors
+      points:   (N_subset, 3) original subset
+      children: [] or [child0, child1]
+    """
 
-    return reordered_vertices, reordered_triangle_strip
+    def __init__(self, center, axes, residuals, points):
+        self.center = center
+        self.axes = axes
+        self.residuals = residuals
+        self.points = points
+        self.children = []
 
-
-class SimpleEllipsoidFitter(Encoder):
+class BaseEllipsoidFitter(Encoder):
 
     def __init__(self, vertex_quantization_error: float = 0.0005, max_hierarchical_fitting_depth: int = 3,
                  pack_strip: Packing = Packing.RADIX_BINARY_TREE,
@@ -49,102 +61,38 @@ class SimpleEllipsoidFitter(Encoder):
         self.pack_vertices: Packing = pack_vertices
         self.verbose = verbose
         self.allow_reorder = allow_reorder
+        self.byte_array = bytearray()
 
-    class EllipsoidNode:
-        """
-        Node for hierarchical ellipsoid fit.
-        Attributes:
-          center:   (3,) fitted center
-          axes:     (3,) fitted semi‐axes
-          residuals:(N_subset, 3) residual vectors
-          points:   (N_subset, 3) original subset
-          children: [] or [child0, child1]
-        """
-
-        def __init__(self, center, axes, residuals, points):
-            self.center = center
-            self.axes = axes
-            self.residuals = residuals
-            self.points = points
-            self.children = []
 
     def encode(self, model: Model) -> CompressedModel:
-        triangle_strip = triangle_list_to_strip([[t.a, t.b, t.c] for t in model.triangles])
-        vertices = model.vertices
+        self.encode_triangles(model)
+        self.encode_vertices(model)
 
-        byte_array = bytearray()
+        bits_per_vertex = len(self.byte_array) * 8 / len(model.vertices)
+        bits_per_triangle = len(self.byte_array) * 8 / len(model.triangles)
 
-        byte_array.extend(struct.pack('I', len(model.vertices)))
-        byte_array.extend(struct.pack('I', len(triangle_strip)))
+        return CompressedModel(bytes(self.byte_array), bits_per_vertex, bits_per_triangle)
 
-        byte_array.extend(struct.pack('f', model.aabb.min.x))
-        byte_array.extend(struct.pack('f', model.aabb.min.y))
-        byte_array.extend(struct.pack('f', model.aabb.min.z))
-
-        byte_array.extend(struct.pack('f', model.aabb.max.x))
-        byte_array.extend(struct.pack('f', model.aabb.max.y))
-        byte_array.extend(struct.pack('f', model.aabb.max.z))
-
-        if self.verbose:
-            print("SimpleQuantizator verbose statistics:")
-            print(f"- Header (in bytes): {len(byte_array)}")
-
-        len_before_triangle_strip = len(byte_array)
-
-        match self.pack_strip:
-            case Packing.NONE:
-                for index in triangle_strip:
-                    byte_array.extend(struct.pack('I', index))
-            case Packing.FIXED:
-                extend_bytearray_with_fixed_size_values(byte_array, int(np.ceil(np.log2(len(model.vertices)))),
-                                                        triangle_strip)
-            case Packing.BINARY_RANGE_PARTITIONING:
-                codes = calculate_codes_using_binary_range_partitioning(len(model.vertices) - 1)
-
-                if self.allow_reorder:
-                    indices_remapping = calculate_remapping(triangle_strip, codes)
-                    vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, indices_remapping)
-
-                bit_codes = [codes[v] for v in triangle_strip]
-                extend_bytearray_with_bit_codes(byte_array, bit_codes)
-            case Packing.RADIX_BINARY_TREE:
-                codes = calculate_codes_using_binary_radix_tree(len(model.vertices) - 1)
-
-                if self.allow_reorder:
-                    indices_remapping = calculate_remapping(triangle_strip, codes)
-                    vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, indices_remapping)
-
-                bit_codes = [codes[v] for v in triangle_strip]
-                extend_bytearray_with_bit_codes(byte_array, bit_codes)
+    @abstractmethod
+    def encode_triangles(self, model):
+        ...
+    def encode_vertices(self, model):
+        len_before_vertices = len(self.byte_array)
+        ellipsoid_node = self.fit_ellipsoids(model.vertices, self.max_hierarchical_fitting_depth)
+        self.write_ellipsoids_header(ellipsoid_node, self.byte_array)
+        self.write_quantize_ellipsoid_residuals(ellipsoid_node, model, self.byte_array)
 
         if self.verbose:
-            print(f"- Triangles strip entropy: {calculate_entropy(triangle_strip):.3f}")
-            bytes_used_for_strip = len(byte_array) - len_before_triangle_strip
-            print(f"- Triangles strip average code bit length: {bytes_used_for_strip * 8 / len(triangle_strip):.3f}")
-            print(f"- Triangles strip (in bytes): {bytes_used_for_strip}")
-
-        len_before_vertices = len(byte_array)
-        ellipsoid_node = self.fit_ellipsoids(vertices, self.max_hierarchical_fitting_depth)
-        self.write_ellipsoids_header(ellipsoid_node, byte_array)
-        self.write_quantize_ellipsoid_residuals(ellipsoid_node, model, byte_array)
-
-        if self.verbose:
-            # print(f"- Quantized vertices entropy: {calculate_entropy(quantized_vertices)}")
-            bytes_used_for_vertices = len(byte_array) - len_before_vertices
+            bytes_used_for_vertices = len(self.byte_array) - len_before_vertices
             print(
                 f"- Quantized vertices average code bit length: {bytes_used_for_vertices * 8 / len(model.vertices):.3f}")
             print(f"- Quantized vertices (in bytes): {bytes_used_for_vertices}")
-
-        bits_per_vertex = len(byte_array) * 8 / len(model.vertices)
-        bits_per_triangle = len(byte_array) * 8 / len(model.triangles)
-
-        return CompressedModel(bytes(byte_array), bits_per_vertex, bits_per_triangle)
 
     def write_ellipsoids_header(self, ellipsoid_node: EllipsoidNode, byte_array: bytearray):
         ellipsoid_node_depth = 3
         byte_array.extend(struct.pack('I', ellipsoid_node_depth))
 
-        def recurse(root: SimpleEllipsoidFitter.EllipsoidNode):
+        def recurse(root: EllipsoidNode):
             byte_array.extend(struct.pack('f', root.center[0]))
             byte_array.extend(struct.pack('f', root.center[1]))
             byte_array.extend(struct.pack('f', root.center[2]))
@@ -159,7 +107,7 @@ class SimpleEllipsoidFitter(Encoder):
         recurse(ellipsoid_node)
 
     def write_quantize_ellipsoid_residuals(self, ellipsoid_node: EllipsoidNode, model: Model, byte_array: bytearray):
-        leafs: list[SimpleEllipsoidFitter.EllipsoidNode] = []
+        leafs: list[EllipsoidNode] = []
         self.get_tree_leafs(ellipsoid_node, leafs)
 
         original_model_size = model.aabb.size()
@@ -216,12 +164,12 @@ class SimpleEllipsoidFitter(Encoder):
 
         points = np.array([[v.x, v.y, v.z] for v in vertices], dtype=np.float32)
 
-        def recurse(sub_pts: np.ndarray, depth: int) -> SimpleEllipsoidFitter.EllipsoidNode:
+        def recurse(sub_pts: np.ndarray, depth: int) -> EllipsoidNode:
             # 1) Nonlinear ellipsoid fit
             center, axes = self.fit_axis_aligned_ellipsoid_nn(sub_pts, num_iters=2000)
             # 2) Compute residuals
             residuals = self.compute_ellipsoid_residuals(sub_pts, center, axes)
-            node = self.EllipsoidNode(center, axes, residuals, sub_pts)
+            node = EllipsoidNode(center, axes, residuals, sub_pts)
 
             # 3) Split if not at max depth
             if depth < max_depth and sub_pts.shape[0] > 10:
@@ -362,3 +310,149 @@ class SimpleEllipsoidFitter(Encoder):
         split_val = (coord.max() + coord.min()) / 2.0
         mask0 = coord < split_val
         return points[mask0], points[~mask0]
+
+
+class SimpleEllipsoidFitter(BaseEllipsoidFitter):
+    def encode_triangles(self, model: Model):
+        triangle_strip = triangle_list_to_strip([[t.a, t.b, t.c] for t in model.triangles])
+        vertices = model.vertices
+
+        byte_array = self.byte_array
+
+        byte_array.extend(struct.pack('I', len(model.vertices)))
+        byte_array.extend(struct.pack('I', len(triangle_strip)))
+
+        byte_array.extend(struct.pack('f', model.aabb.min.x))
+        byte_array.extend(struct.pack('f', model.aabb.min.y))
+        byte_array.extend(struct.pack('f', model.aabb.min.z))
+
+        byte_array.extend(struct.pack('f', model.aabb.max.x))
+        byte_array.extend(struct.pack('f', model.aabb.max.y))
+        byte_array.extend(struct.pack('f', model.aabb.max.z))
+
+        if self.verbose:
+            print("SimpleEllipsoidFitter verbose statistics:")
+            print(f"- Header (in bytes): {len(byte_array)}")
+
+        len_before_triangle_strip = len(byte_array)
+
+        match self.pack_strip:
+            case Packing.NONE:
+                for index in triangle_strip:
+                    byte_array.extend(struct.pack('I', index))
+            case Packing.FIXED:
+                extend_bytearray_with_fixed_size_values(byte_array, int(np.ceil(np.log2(len(model.vertices)))),
+                                                        triangle_strip)
+            case Packing.BINARY_RANGE_PARTITIONING:
+                codes = calculate_codes_using_binary_range_partitioning(len(model.vertices) - 1)
+
+                if self.allow_reorder:
+                    indices_remapping = calculate_remapping(triangle_strip, codes)
+                    vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, indices_remapping)
+                    model.vertices = vertices
+
+                bit_codes = [codes[v] for v in triangle_strip]
+                extend_bytearray_with_bit_codes(byte_array, bit_codes)
+            case Packing.RADIX_BINARY_TREE:
+                codes = calculate_codes_using_binary_radix_tree(len(model.vertices) - 1)
+
+                if self.allow_reorder:
+                    indices_remapping = calculate_remapping(triangle_strip, codes)
+                    vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, indices_remapping)
+                    model.vertices = vertices
+
+                bit_codes = [codes[v] for v in triangle_strip]
+                extend_bytearray_with_bit_codes(byte_array, bit_codes)
+
+        if self.verbose:
+            print(f"- Triangles strip entropy: {calculate_entropy(triangle_strip):.3f}")
+            bytes_used_for_strip = len(byte_array) - len_before_triangle_strip
+            print(f"- Triangles strip average code bit length: {bytes_used_for_strip * 8 / len(triangle_strip):.3f}")
+            print(f"- Triangles strip (in bytes): {bytes_used_for_strip}")
+
+class PackedGTSEllipsoidFitter(BaseEllipsoidFitter):
+    def encode_triangles(self, model: Model):
+        triangle_strip, strip_side_bits = triangle_list_to_generalized_strip([[t.a, t.b, t.c] for t in model.triangles])
+        vertices = model.vertices
+
+        def calculate_reorder_map():
+            reorder_map = dict()
+            reorder_index = 0
+            for vertex in triangle_strip:
+                if vertex in reorder_map:
+                    continue
+                reorder_map[vertex] = reorder_index
+                reorder_index += 1
+
+            return reorder_map
+
+        reorder_map = calculate_reorder_map()
+
+        vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, reorder_map)
+        model.vertices = vertices
+
+        self.triangle_strip = triangle_strip
+        self.strip_side_bits = strip_side_bits
+        self.vertices = vertices
+
+        def calculate_reuse_and_increment_buffers():
+            reuse_buffer = []
+            used_buffer = {triangle_strip[0]}
+            increment_flag_buffer = [1]
+
+            for i in range(1, len(triangle_strip)):
+                current_vertex = triangle_strip[i]
+
+                if current_vertex in used_buffer:
+                    reuse_buffer.append(current_vertex)
+                    increment_flag_buffer.append(0)
+                else:
+                    increment_flag_buffer.append(1)
+                    used_buffer.add(current_vertex)
+
+            return reuse_buffer, increment_flag_buffer
+
+        reuse_buffer, increment_flag_buffer = calculate_reuse_and_increment_buffers()
+
+        byte_array = self.byte_array
+
+        byte_array.extend(struct.pack('I', len(model.vertices)))
+        byte_array.extend(struct.pack('I', len(triangle_strip)))
+
+        byte_array.extend(struct.pack('f', model.aabb.min.x))
+        byte_array.extend(struct.pack('f', model.aabb.min.y))
+        byte_array.extend(struct.pack('f', model.aabb.min.z))
+
+        byte_array.extend(struct.pack('f', model.aabb.max.x))
+        byte_array.extend(struct.pack('f', model.aabb.max.y))
+        byte_array.extend(struct.pack('f', model.aabb.max.z))
+
+        if self.verbose:
+            print("PackedGTSEllipsoidFitter verbose statistics:")
+            print(f"- Header (in bytes): {len(byte_array)}")
+
+        len_before_triangle_strip = len(byte_array)
+
+        extend_bytearray_with_fixed_size_values(byte_array, 1, strip_side_bits[3:])
+        extend_bytearray_with_fixed_size_values(byte_array, 1, increment_flag_buffer[3:])
+
+        max_reuse_buffer_value = np.max(reuse_buffer)
+        match self.pack_strip:
+            case Packing.FIXED:
+                extend_bytearray_with_fixed_size_values(byte_array, int(np.ceil(np.log2(max_reuse_buffer_value))),
+                                                        reuse_buffer)
+            case Packing.BINARY_RANGE_PARTITIONING:
+                codes = calculate_codes_using_binary_range_partitioning(max_reuse_buffer_value)
+                bit_codes = [codes[v] for v in reuse_buffer]
+                extend_bytearray_with_bit_codes(byte_array, bit_codes)
+            case Packing.RADIX_BINARY_TREE:
+                codes = calculate_codes_using_binary_radix_tree(max_reuse_buffer_value)
+                bit_codes = [codes[v] for v in reuse_buffer]
+                extend_bytearray_with_bit_codes(byte_array, bit_codes)
+
+        if self.verbose:
+            print(
+                f"- Triangles strip entropy: {(calculate_entropy(reuse_buffer) + calculate_entropy(strip_side_bits[3:]) + calculate_entropy(increment_flag_buffer[3:])):.3f}")
+            bytes_used_for_strip = len(byte_array) - len_before_triangle_strip
+            print(f"- Triangles strip average code bit length: {bytes_used_for_strip * 8 / len(triangle_strip):.3f}")
+            print(f"- Triangles strip (in bytes): {bytes_used_for_strip}")

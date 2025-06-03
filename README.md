@@ -41,7 +41,9 @@ The following table summarizes the statistics for each compression model:
 | **GTSParallelogramPredictor (arithmetic encoder)**           | 4.92               | 9.77             | 3.67             |
 | **GTSParallelogramPredictor (adaptive arithmetic encoder)**  | 4.90               | 9.73             | 3.68             |
 | **SimpleEllipsoidFitter(0.0005, 3)**                         | 4.34               | 8.61             | 4.16             |
-| **SimpleEllipsoidFitter(0.0005, 4)**                         | **4.16**           | **8.26**         | **4.34**         |
+| **SimpleEllipsoidFitter(0.0005, 4)**                         | 4.16               | 8.26             | 4.34             |
+| **PackedGTSEllipsoidFitter(0.0005, 3)**                      | 2.93               | 5.82             | 6.16             |
+| **PackedGTSEllipsoidFitter(0.0005, 4)**                      | **2.75**           | **5.47**         | **6.55**         |
 
 Each encoder model applies a different strategy for compressing 3D mesh data, allowing users to balance compression rate and computational complexity according to their needs.
 

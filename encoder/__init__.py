@@ -3,4 +3,4 @@ from .implementation.baseline import BaselineEncoder
 from .implementation.quantization import SimpleQuantizator
 from .implementation.gtsquantization import GTSQuantizator, PackedGTSQuantizator
 from .implementation.GTSParallelogramPredictor import GTSParallelogramPredictor
-from .implementation.elipsoid_fitter import SimpleEllipsoidFitter
+from .implementation.elipsoid_fitter import SimpleEllipsoidFitter, PackedGTSEllipsoidFitter
