@@ -163,17 +163,18 @@ class SimpleEllipsoidFitter(Encoder):
         self.get_tree_leafs(ellipsoid_node, leafs)
 
         original_model_size = model.aabb.size()
+        original_model_largest_size = max(original_model_size.x, original_model_size.y, original_model_size.z)
         for leaf in leafs:
             mins_res = leaf.residuals.min(axis=0)
             maxs_res = leaf.residuals.max(axis=0)
             aabb = AABB(Vertex(mins_res[0], mins_res[1], mins_res[2]), Vertex(maxs_res[0], maxs_res[1], maxs_res[2]))
             aabb_size = aabb.size()
             bits_needed_x = int(
-                math.ceil(math.log2(aabb_size.x / (original_model_size.x * self.vertex_quantization_error))))
+                math.ceil(math.log2(aabb_size.x / (original_model_largest_size * self.vertex_quantization_error))))
             bits_needed_y = int(
-                math.ceil(math.log2(aabb_size.y / (original_model_size.y * self.vertex_quantization_error))))
+                math.ceil(math.log2(aabb_size.y / (original_model_largest_size * self.vertex_quantization_error))))
             bits_needed_z = int(
-                math.ceil(math.log2(aabb_size.z / (original_model_size.z * self.vertex_quantization_error))))
+                math.ceil(math.log2(aabb_size.z / (original_model_largest_size * self.vertex_quantization_error))))
 
             N = len(leaf.residuals)
             byte_array.extend(struct.pack('I', N))
