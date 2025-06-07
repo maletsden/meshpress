@@ -1,6 +1,10 @@
 # Assets
 /assets
 
+# Pickles
+/pickles
+*.pkl
+
 # IDE
 .idea
 

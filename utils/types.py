@@ -140,6 +140,8 @@ class Model:
     vertices: List[Vertex] = field(default_factory=list)
     triangles: List[Triangle] = field(default_factory=list)
 
+    triangle_strips: List[List[int]] = field(default_factory=list)
+
     @property
     def aabb(self) -> AABB:
         aabb: AABB = AABB()
@@ -159,7 +161,8 @@ class Model:
             aabb.max.z = max(vertex.z, aabb.max.z)
 
         return aabb
-
+    def copy(self) -> 'Model':
+        return Model(self.vertices.copy(), self.triangles.copy())
 
 @dataclass
 class CompressedModel:

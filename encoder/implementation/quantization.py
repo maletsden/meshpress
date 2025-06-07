@@ -2,6 +2,7 @@ from utils.types import *
 from ..encoder import Encoder, Packing
 import struct
 from utils.bit_magic import *
+import math
 from utils.geometry import triangle_list_to_strip
 
 import numpy as np
@@ -35,17 +36,27 @@ def reorder_vertices(vertices, triangle_strip, indices_remap):
 
 
 class SimpleQuantizator(Encoder):
-
     def __init__(self, pack_strip: Packing = Packing.RADIX_BINARY_TREE, pack_vertices: Packing = Packing.FIXED,
+                 vertex_quantization_error: float = 0.0005,
                  allow_reorder=False,
                  verbose=False):
         self.pack_strip: Packing = pack_strip
         self.pack_vertices: Packing = pack_vertices
+        self.vertex_quantization_error: float = vertex_quantization_error
         self.verbose = verbose
         self.allow_reorder = allow_reorder
 
     def encode(self, model: Model) -> CompressedModel:
-        triangle_strip = triangle_list_to_strip([[t.a, t.b, t.c] for t in model.triangles])
+        triangle_strip = []
+
+        for i, strip in enumerate(model.triangle_strips):
+            if i != 0:
+                triangle_strip.append(strip[0])
+                triangle_strip.append(strip[0])
+            triangle_strip.extend(strip)
+            if i != len(model.triangle_strips) - 1:
+                triangle_strip.append(strip[-1])
+                triangle_strip.append(strip[-1])
         vertices = model.vertices
 
         byte_array = bytearray()
@@ -100,28 +111,60 @@ class SimpleQuantizator(Encoder):
             print(f"- Triangles strip (in bytes): {bytes_used_for_strip}")
 
         len_before_vertices = len(byte_array)
-        quantized_vertices = quantize_vertices(vertices, model.aabb, 12)
+        aabb = model.aabb
+        aabb_size = model.aabb.size()
+        aabb_size_largest = max(aabb_size.x, aabb_size.y, aabb_size.z)
 
-        match self.pack_vertices:
-            case Packing.NONE:
-                for vertex in quantized_vertices:
-                    byte_array.extend(struct.pack('I', vertex))
-            case Packing.FIXED:
-                extend_bytearray_with_12bit_values(byte_array, quantized_vertices)
-            case Packing.BINARY_RANGE_PARTITIONING:
-                codes = calculate_codes_using_binary_range_partitioning(2 ** 12 - 1)
-                bit_codes = [codes[v] for v in quantized_vertices]
-                extend_bytearray_with_bit_codes(byte_array, bit_codes)
-            case Packing.RADIX_BINARY_TREE:
-                codes = calculate_codes_using_binary_radix_tree(2 ** 12 - 1)
-                bit_codes = [codes[v] for v in quantized_vertices]
-                extend_bytearray_with_bit_codes(byte_array, bit_codes)
+        max_quantized_value_x = math.ceil(aabb_size.x / (aabb_size_largest * self.vertex_quantization_error))
+        max_quantized_value_y = math.ceil(aabb_size.y / (aabb_size_largest * self.vertex_quantization_error))
+        max_quantized_value_z = math.ceil(aabb_size.z / (aabb_size_largest * self.vertex_quantization_error))
 
+        byte_array.extend(struct.pack('I', max_quantized_value_x))
+        byte_array.extend(struct.pack('I', max_quantized_value_y))
+        byte_array.extend(struct.pack('I', max_quantized_value_z))
+
+        quantized_vertices_x = [
+            np.uint32((v.x - aabb.min.x) / (aabb.max.x - aabb.min.x) * max_quantized_value_x) for v in vertices
+        ]
+        quantized_vertices_y = [
+            np.uint32((v.y - aabb.min.y) / (aabb.max.y - aabb.min.y) * max_quantized_value_y) for v in vertices
+        ]
+        quantized_vertices_z = [
+            np.uint32((v.z - aabb.min.z) / (aabb.max.z - aabb.min.z) * max_quantized_value_z) for v in vertices
+        ]
+
+        assert len(quantized_vertices_x) == len(vertices)
+        assert len(quantized_vertices_y) == len(vertices)
+        assert len(quantized_vertices_z) == len(vertices)
+
+        for data, max_val in zip(
+                (quantized_vertices_x, quantized_vertices_y, quantized_vertices_z),
+                (max_quantized_value_x, max_quantized_value_y, max_quantized_value_z)
+        ):
+            len_byte_array_local = len(byte_array)
+            match self.pack_vertices:
+                case Packing.NONE:
+                    extend_bytearray_with_fixed_size_values(byte_array, 32, data)
+                case Packing.FIXED:
+                    extend_bytearray_with_fixed_size_values(byte_array, math.ceil(math.log2(max_val)), data)
+                case Packing.BINARY_RANGE_PARTITIONING:
+                    codes = calculate_codes_using_binary_range_partitioning(max_val)
+                    bit_codes = [codes[v] for v in data]
+                    extend_bytearray_with_bit_codes(byte_array, bit_codes)
+                case Packing.RADIX_BINARY_TREE:
+                    codes = calculate_codes_using_binary_radix_tree(max_val)
+                    bit_codes = [codes[v] for v in data]
+                    extend_bytearray_with_bit_codes(byte_array, bit_codes)
+            if self.verbose:
+                print(f"- Max quantized value: {max_val}")
+                print(f"- Average bits used for quantized value: {(len(byte_array) - len_byte_array_local) * 8 / len(data):.3f}")
         if self.verbose:
-            print(f"- Quantized vertices entropy: {calculate_entropy(quantized_vertices)}")
+            print(
+                f"- Quantized vertices entropy: {sum(calculate_entropy(d) for d in (quantized_vertices_x, quantized_vertices_y, quantized_vertices_z))}")
             bytes_used_for_vertices = len(byte_array) - len_before_vertices
             print(
-                f"- Quantized vertices average code bit length: {bytes_used_for_vertices * 8 / len(quantized_vertices):.3f}")
+                f"- Quantized vertices average code bit length: {bytes_used_for_vertices * 8 / (len(quantized_vertices_x)):.3f}")
+
             print(f"- Quantized vertices (in bytes): {bytes_used_for_vertices}")
 
         bits_per_vertex = len(byte_array) * 8 / len(model.vertices)
