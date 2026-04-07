@@ -117,12 +117,13 @@ class BaseEllipsoidFitter(Encoder):
             maxs_res = leaf.residuals.max(axis=0)
             aabb = AABB(Vertex(mins_res[0], mins_res[1], mins_res[2]), Vertex(maxs_res[0], maxs_res[1], maxs_res[2]))
             aabb_size = aabb.size()
-            bits_needed_x = int(
-                math.ceil(math.log2(aabb_size.x / (original_model_largest_size * self.vertex_quantization_error))))
-            bits_needed_y = int(
-                math.ceil(math.log2(aabb_size.y / (original_model_largest_size * self.vertex_quantization_error))))
-            bits_needed_z = int(
-                math.ceil(math.log2(aabb_size.z / (original_model_largest_size * self.vertex_quantization_error))))
+            error_threshold = original_model_largest_size * self.vertex_quantization_error
+            bits_needed_x = max(1, int(
+                math.ceil(math.log2(max(aabb_size.x / error_threshold, 2)))))
+            bits_needed_y = max(1, int(
+                math.ceil(math.log2(max(aabb_size.y / error_threshold, 2)))))
+            bits_needed_z = max(1, int(
+                math.ceil(math.log2(max(aabb_size.z / error_threshold, 2)))))
 
             N = len(leaf.residuals)
             byte_array.extend(struct.pack('I', N))
@@ -136,7 +137,9 @@ class BaseEllipsoidFitter(Encoder):
             byte_array.extend(struct.pack('f', aabb.max.y))
             byte_array.extend(struct.pack('f', aabb.max.z))
 
-            normalized_residuals = (leaf.residuals - mins_res) / (maxs_res - mins_res)
+            res_range = maxs_res - mins_res
+            res_range = np.where(res_range < 1e-12, 1.0, res_range)
+            normalized_residuals = (leaf.residuals - mins_res) / res_range
             data_x = [np.uint32(v[0] * (2 ** bits_needed_x - 1)) for v in normalized_residuals]
             data_y = [np.uint32(v[1] * (2 ** bits_needed_y - 1)) for v in normalized_residuals]
             data_z = [np.uint32(v[2] * (2 ** bits_needed_z - 1)) for v in normalized_residuals]
@@ -369,6 +372,209 @@ class SimpleEllipsoidFitter(BaseEllipsoidFitter):
             bytes_used_for_strip = len(byte_array) - len_before_triangle_strip
             print(f"- Triangles strip average code bit length: {bytes_used_for_strip * 8 / len(triangle_strip):.3f}")
             print(f"- Triangles strip (in bytes): {bytes_used_for_strip}")
+
+class SphericalHierarchicalFitter(BaseEllipsoidFitter):
+    """
+    Hierarchical ellipsoid fitter with angular splitting + Cartesian residuals.
+
+    Approach:
+    1. Fit global ellipsoid to all vertices
+    2. Convert vertices to spherical coords in ellipsoid-normalized space
+    3. Recursively split original points by angular position (θ/φ median)
+    4. At each leaf: fit a LOCAL ellipsoid to the original points in that angular cell
+    5. Encode Cartesian residuals from the local ellipsoid (same format as existing approach)
+
+    The savings come from angular cells containing geometrically coherent surface patches,
+    so the local ellipsoid fits are much tighter → smaller Cartesian residuals → fewer bits.
+    """
+
+    def __init__(self, spherical_tree_depth=4, **kwargs):
+        super().__init__(**kwargs)
+        self.spherical_tree_depth = spherical_tree_depth
+
+    def encode_triangles(self, model: Model):
+        # Reuse PackedGTS triangle encoding
+        triangle_strip, strip_side_bits = triangle_list_to_generalized_strip(
+            [[t.a, t.b, t.c] for t in model.triangles])
+        vertices = model.vertices
+
+        def calculate_reorder_map():
+            reorder_map = dict()
+            reorder_index = 0
+            for vertex in triangle_strip:
+                if vertex in reorder_map:
+                    continue
+                reorder_map[vertex] = reorder_index
+                reorder_index += 1
+            return reorder_map
+
+        reorder_map = calculate_reorder_map()
+        vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, reorder_map)
+        model.vertices = vertices
+
+        self.triangle_strip = triangle_strip
+        self.strip_side_bits = strip_side_bits
+        self.vertices = vertices
+
+        def calculate_reuse_and_increment_buffers():
+            reuse_buffer = []
+            used_buffer = {triangle_strip[0]}
+            increment_flag_buffer = [1]
+            for i in range(1, len(triangle_strip)):
+                current_vertex = triangle_strip[i]
+                if current_vertex in used_buffer:
+                    reuse_buffer.append(current_vertex)
+                    increment_flag_buffer.append(0)
+                else:
+                    increment_flag_buffer.append(1)
+                    used_buffer.add(current_vertex)
+            return reuse_buffer, increment_flag_buffer
+
+        reuse_buffer, increment_flag_buffer = calculate_reuse_and_increment_buffers()
+
+        byte_array = self.byte_array
+        byte_array.extend(struct.pack('I', len(model.vertices)))
+        byte_array.extend(struct.pack('I', len(triangle_strip)))
+        byte_array.extend(struct.pack('f', model.aabb.min.x))
+        byte_array.extend(struct.pack('f', model.aabb.min.y))
+        byte_array.extend(struct.pack('f', model.aabb.min.z))
+        byte_array.extend(struct.pack('f', model.aabb.max.x))
+        byte_array.extend(struct.pack('f', model.aabb.max.y))
+        byte_array.extend(struct.pack('f', model.aabb.max.z))
+
+        if self.verbose:
+            print("SphericalHierarchicalFitter verbose statistics:")
+            print(f"- Header (in bytes): {len(byte_array)}")
+
+        len_before_triangle_strip = len(byte_array)
+
+        extend_bytearray_with_fixed_size_values(byte_array, 1, strip_side_bits[3:])
+        extend_bytearray_with_fixed_size_values(byte_array, 1, increment_flag_buffer[3:])
+
+        max_reuse_buffer_value = np.max(reuse_buffer)
+        match self.pack_strip:
+            case Packing.FIXED:
+                extend_bytearray_with_fixed_size_values(
+                    byte_array, int(np.ceil(np.log2(max_reuse_buffer_value))), reuse_buffer)
+            case Packing.BINARY_RANGE_PARTITIONING:
+                codes = calculate_codes_using_binary_range_partitioning(max_reuse_buffer_value)
+                bit_codes = [codes[v] for v in reuse_buffer]
+                extend_bytearray_with_bit_codes(byte_array, bit_codes)
+            case Packing.RADIX_BINARY_TREE:
+                codes = calculate_codes_using_binary_radix_tree(max_reuse_buffer_value)
+                bit_codes = [codes[v] for v in reuse_buffer]
+                extend_bytearray_with_bit_codes(byte_array, bit_codes)
+
+        if self.verbose:
+            print(f"- Triangles strip entropy: "
+                  f"{(calculate_entropy(reuse_buffer) + calculate_entropy(strip_side_bits[3:]) + calculate_entropy(increment_flag_buffer[3:])):.3f}")
+            bytes_used_for_strip = len(byte_array) - len_before_triangle_strip
+            print(f"- Triangles strip average code bit length: {bytes_used_for_strip * 8 / len(triangle_strip):.3f}")
+            print(f"- Triangles strip (in bytes): {bytes_used_for_strip}")
+
+    def encode_vertices(self, model: Model):
+        len_before_vertices = len(self.byte_array)
+
+        # Build angular-split ellipsoid tree instead of the base class Cartesian split
+        ellipsoid_node = self.fit_ellipsoids_angular(model.vertices)
+        self.write_ellipsoids_header(ellipsoid_node, self.byte_array)
+        self.write_quantize_ellipsoid_residuals(ellipsoid_node, model, self.byte_array)
+
+        if self.verbose:
+            bytes_used_for_vertices = len(self.byte_array) - len_before_vertices
+            print(f"- Quantized vertices average code bit length: "
+                  f"{bytes_used_for_vertices * 8 / len(model.vertices):.3f}")
+            print(f"- Quantized vertices (in bytes): {bytes_used_for_vertices}")
+
+            # Print per-leaf stats
+            leafs = []
+            self.get_tree_leafs(ellipsoid_node, leafs)
+            print(f"- Number of angular leaves: {len(leafs)}")
+            for i, leaf in enumerate(leafs):
+                res_range = leaf.residuals.max(axis=0) - leaf.residuals.min(axis=0)
+                print(f"  Leaf {i}: {len(leaf.residuals)} pts, "
+                      f"residual_range=({res_range[0]:.6f}, {res_range[1]:.6f}, {res_range[2]:.6f})")
+
+    def fit_ellipsoids_angular(self, vertices: List[Vertex]) -> EllipsoidNode:
+        """
+        Two-phase hierarchical ellipsoid fitting:
+        Phase 1 (angular): Split original points by θ/φ position on parent ellipsoid.
+                           Creates coherent surface patches.
+        Phase 2 (residual): Within each angular cell, do multi-level residual fitting
+                           (fit ellipsoids to residuals, then to residuals of residuals).
+                           This is the same approach as the existing fit_ellipsoids.
+
+        The combination yields both spatial coherence (angular) AND multi-level
+        residual compression (residual phase).
+        """
+        points = np.array([[v.x, v.y, v.z] for v in vertices], dtype=np.float32)
+
+        def compute_angles(sub_pts, center, axes):
+            """Compute θ, φ for points in ellipsoid-normalized space."""
+            p_c = sub_pts - center.reshape(1, 3)
+            p_norm = p_c / axes.reshape(1, 3)
+            r = np.linalg.norm(p_norm, axis=1)
+            theta = np.arccos(np.clip(p_norm[:, 2] / np.maximum(r, 1e-12), -1, 1))
+            phi = np.arctan2(p_norm[:, 1], p_norm[:, 0])
+            return theta, phi
+
+        def residual_recurse(sub_residuals: np.ndarray, depth: int) -> EllipsoidNode:
+            """Phase 2: multi-level residual fitting (fits ellipsoids to residuals)."""
+            center, axes = self.fit_axis_aligned_ellipsoid_nn(sub_residuals, num_iters=2000)
+            residuals = self.compute_ellipsoid_residuals(sub_residuals, center, axes)
+            node = EllipsoidNode(center, axes, residuals, sub_residuals)
+
+            if depth < self.max_hierarchical_fitting_depth and sub_residuals.shape[0] > 10:
+                pts0, pts1 = self.split_points_along_longest_axis(residuals, center, axes)
+                if pts0.shape[0] > 0 and pts1.shape[0] > 0:
+                    node.children = [
+                        residual_recurse(pts0, depth + 1),
+                        residual_recurse(pts1, depth + 1),
+                    ]
+
+            return node
+
+        def angular_recurse(sub_pts: np.ndarray, depth: int, split_axis: int) -> EllipsoidNode:
+            """Phase 1: angular splitting of original points."""
+            center, axes = self.fit_axis_aligned_ellipsoid_nn(sub_pts, num_iters=2000)
+            residuals = self.compute_ellipsoid_residuals(sub_pts, center, axes)
+            node = EllipsoidNode(center, axes, residuals, sub_pts)
+
+            if depth < self.spherical_tree_depth and sub_pts.shape[0] > 10:
+                # Angular splitting: split original points by θ or φ
+                theta, phi = compute_angles(sub_pts, center, axes)
+                angles = theta if split_axis == 0 else phi
+                median = np.median(angles)
+                left_mask = angles <= median
+                right_mask = ~left_mask
+
+                if left_mask.sum() > 0 and right_mask.sum() > 0:
+                    node.children = [
+                        angular_recurse(sub_pts[left_mask], depth + 1, 1 - split_axis),
+                        angular_recurse(sub_pts[right_mask], depth + 1, 1 - split_axis),
+                    ]
+                else:
+                    # Can't split angularly, transition to residual phase
+                    self._add_residual_children(node, residuals, residual_recurse)
+            else:
+                # Done with angular phase, transition to residual phase
+                self._add_residual_children(node, residuals, residual_recurse)
+
+            return node
+
+        return angular_recurse(points, depth=0, split_axis=0)
+
+    def _add_residual_children(self, node, residuals, residual_recurse_fn):
+        """Transition from angular phase to residual phase."""
+        if self.max_hierarchical_fitting_depth > 0 and residuals.shape[0] > 10:
+            pts0, pts1 = self.split_points_along_longest_axis(
+                residuals, node.center, node.axes)
+            if pts0.shape[0] > 0 and pts1.shape[0] > 0:
+                node.children = [
+                    residual_recurse_fn(pts0, 1),
+                    residual_recurse_fn(pts1, 1),
+                ]
+
 
 class PackedGTSEllipsoidFitter(BaseEllipsoidFitter):
     def encode_triangles(self, model: Model):

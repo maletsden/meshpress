@@ -7,19 +7,34 @@ from utils.geometry import triangle_list_to_generalized_strip, reorder_vertices
 from utils.entropy_encoders import IntegerBinaryArithmeticEncoder, HuffmanEncoder
 import numpy as np
 from scipy.stats import norm
+import math
 
 
-class GTSParallelogramPredictor(Encoder):
+class TSParallelogramPredictor(Encoder):
     def __init__(self, pack_strip: Packing = Packing.RADIX_BINARY_TREE,
+                 vertex_quantization_error: float = 0.0005,
                  entropy_encoder_type: Packing = Packing.ARITHMETIC_ENCODER,
                  enable_entropy_encoder_conditional_probabilities: bool = False, verbose=False):
         self.pack_strip: Packing = pack_strip
+        self.vertex_quantization_error: float = vertex_quantization_error
         self.verbose = verbose
         self.entropy_encoder_type = entropy_encoder_type
         self.enable_entropy_encoder_conditional_probabilities = enable_entropy_encoder_conditional_probabilities
 
     def encode(self, model: Model) -> CompressedModel:
-        triangle_strip, strip_side_bits = triangle_list_to_generalized_strip([[t.a, t.b, t.c] for t in model.triangles])
+        # triangle_strip, strip_side_bits = triangle_list_to_generalized_strip([[t.a, t.b, t.c] for t in model.triangles])
+        self.triangle_strip = []
+        triangle_strip = self.triangle_strip
+
+        for i, strip in enumerate(model.triangle_strips):
+            if i != 0:
+                triangle_strip.append(strip[0])
+                triangle_strip.append(strip[0])
+            triangle_strip.extend(strip)
+            if i != len(model.triangle_strips) - 1:
+                triangle_strip.append(strip[-1])
+                triangle_strip.append(strip[-1])
+
         vertices = model.vertices
 
         def calculate_reorder_map():
@@ -38,7 +53,7 @@ class GTSParallelogramPredictor(Encoder):
         vertices, triangle_strip = reorder_vertices(vertices, triangle_strip, reorder_map)
 
         self.triangle_strip = triangle_strip
-        self.strip_side_bits = strip_side_bits
+        # self.strip_side_bits = strip_side_bits
         self.vertices = vertices
 
         def calculate_reuse_and_increment_buffers():
@@ -81,7 +96,7 @@ class GTSParallelogramPredictor(Encoder):
 
         len_before_triangle_strip = len(byte_array)
 
-        extend_bytearray_with_fixed_size_values(byte_array, 1, strip_side_bits[3:])
+        # extend_bytearray_with_fixed_size_values(byte_array, 1, strip_side_bits[3:])
         extend_bytearray_with_fixed_size_values(byte_array, 1, increment_flag_buffer[3:])
 
         max_reuse_buffer_value = np.max(reuse_buffer)
@@ -100,15 +115,15 @@ class GTSParallelogramPredictor(Encoder):
 
         if self.verbose:
             print(
-                f"- Triangles strip entropy: {(calculate_entropy(reuse_buffer) + calculate_entropy(strip_side_bits[3:]) + calculate_entropy(increment_flag_buffer[3:])):.3f}")
+                f"- Triangles strip entropy: {(calculate_entropy(reuse_buffer) + calculate_entropy(increment_flag_buffer[3:])):.3f}")
             bytes_used_for_strip = len(byte_array) - len_before_triangle_strip
             print(f"- Triangles strip average code bit length: {bytes_used_for_strip * 8 / len(triangle_strip):.3f}")
             print(f"- Triangles strip (in bytes): {bytes_used_for_strip}")
 
         len_before_vertices = len(byte_array)
-        vertices_residuals = self._parallelogram_predictor_generalized_strip(vertices, triangle_strip, strip_side_bits)
+        vertices_residuals = self._parallelogram_predictor_generalized_strip(vertices, triangle_strip)
         vertices_residuals_quantized, vertices_residuals_quantized_bits_needed = self._quantize_residuals(
-            vertices_residuals)
+            model, vertices_residuals, self.vertex_quantization_error)
 
         vertices_residuals_quantized_flat = vertices_residuals_quantized.flatten()
         vertices_residuals_frequencies = Counter(vertices_residuals_quantized_flat)
@@ -141,7 +156,7 @@ class GTSParallelogramPredictor(Encoder):
 
         return CompressedModel(bytes(byte_array), bits_per_vertex, bits_per_triangle)
 
-    def _parallelogram_predictor_generalized_strip(self, vertices, triangle_strip, side_bits):
+    def _parallelogram_predictor_generalized_strip(self, vertices, triangle_strip):
         """
         Encodes a triangle mesh using the parallelogram predictor with a triangle strip and side bits.
 
@@ -170,13 +185,14 @@ class GTSParallelogramPredictor(Encoder):
             current_vertex_index = triangle_strip[i]
             current_vertex_position = vertices[current_vertex_index]
 
-            # Determine prediction based on the side bit
-            if side_bits[i - 3] == 0:
-                # Predict the next vertex assuming the triangle follows a "left" connection
-                predicted_vertex = V1 + (V2 - V0)
-            else:
-                # Predict the next vertex assuming the triangle follows a "right" connection
-                predicted_vertex = V2 + (V1 - V0)
+            predicted_vertex = V2 - V0 + V1
+            # # Determine prediction based on the side bit
+            # if side_bits[i - 3] == 0:
+            #     # Predict the next vertex assuming the triangle follows a "left" connection
+            #     predicted_vertex = V1 + (V2 - V0)
+            # else:
+            #     # Predict the next vertex assuming the triangle follows a "right" connection
+            #     predicted_vertex = V2 + (V1 - V0)
 
             # Compute the residual as the difference between actual and predicted vertices
             residual = current_vertex_position - predicted_vertex
@@ -187,7 +203,7 @@ class GTSParallelogramPredictor(Encoder):
 
         return residuals
 
-    def _quantize_residuals(self, residuals, max_error=0.001):
+    def _quantize_residuals(self, model: Model, residuals: List[Vertex], max_error=0.001):
         """
         Quantizes residuals starting from the 3rd residual.
 
@@ -201,6 +217,37 @@ class GTSParallelogramPredictor(Encoder):
         """
         # Start quantization from the 3rd residual
         residuals = np.array([[t.x, t.y, t.z] for t in residuals])
+
+        aabb = model.aabb
+        aabb_size = model.aabb.size()
+        aabb_size_largest = max(aabb_size.x, aabb_size.y, aabb_size.z)
+
+        max_quantized_value_x = math.ceil(aabb_size.x / (aabb_size_largest * self.vertex_quantization_error))
+        max_quantized_value_y = math.ceil(aabb_size.y / (aabb_size_largest * self.vertex_quantization_error))
+        max_quantized_value_z = math.ceil(aabb_size.z / (aabb_size_largest * self.vertex_quantization_error))
+
+
+        max_quantized_residual_value = []
+        for data, max_quantized_value in zip((residuals[:, 0], residuals[:, 1], residuals[:, 2]),
+                        (max_quantized_value_x, max_quantized_value_y, max_quantized_value_z)):
+            r_min = np.min(data)
+            r_max = np.max(data)
+            data_norm = (data - r_min) / (r_max - r_min)
+
+            for max_val in range(max_quantized_value, 1, -1):
+
+                V0, V1, V2 = data[:3]
+                max_difference = 0.0
+                for residual_V in data_norm[3:]:
+                    quantized = np.round(residual_V * max_val)
+                    dequantized_residual_V = quantized / max_val * (r_max - r_min) + r_min
+                    predicted_vertex = V2 - V0 + V1
+                    V = predicted_vertex + dequantized_residual_V
+                    # TODO: calculate error
+
+            # TODO: select what is max value for quantization to achive quality
+            # for b in range(1, math.ceil(math.log2()))
+            pass
 
         # Find min/max for each dimension (x, y, z)
         r_min = np.min(residuals, axis=0)
