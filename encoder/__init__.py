@@ -8,4 +8,5 @@ from .implementation.adaptive_patches import AdaptivePatchesEncoder, MeshletPred
 from .implementation.meshlet_wavelet import (
     MeshletWaveletEB, MeshletWaveletAMD, MeshletPlainAMD,
     MeshletWaveletGlobalEB, MeshletWaveletGlobalAMD, MeshletWaveletDedupEB,
+    MeshletGTSPlain, MeshletGTSSegDelta, MeshletGTSHaar,
 )

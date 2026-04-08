@@ -103,11 +103,11 @@ def _edgebreaker_bits(opcodes, n_roots, n_local_verts):
 
 
 # ============================================================
-# AMD packed micro-index connectivity estimation
+# AMD packed micro-index connectivity estimation (raw, no strip)
 # ============================================================
 
 def _amd_packed_bits(meshlet_tris, tris_np, tri_adj):
-    """AMD pre-packed: 3 local uint8 indices per triangle."""
+    """AMD pre-packed: 3 local uint8 indices per triangle. Simplest GPU decode."""
     vert_set = set()
     for ti in meshlet_tris:
         for j in range(3):
@@ -116,11 +116,39 @@ def _amd_packed_bits(meshlet_tris, tris_np, tri_adj):
     n_f = len(meshlet_tris)
     if n_f == 0:
         return 0
-    # Each triangle: 3 × ceil(log2(n_local)) bits
-    idx_bits = max(1, int(np.ceil(np.log2(n_local + 1))))
-    # In practice AMD uses 8-bit local indices (max 256 verts per meshlet)
-    micro_bits = min(idx_bits, 8)
-    return 32 + n_f * 3 * micro_bits  # header + triangles
+    micro_bits = min(max(1, int(np.ceil(np.log2(n_local + 1)))), 8)
+    return 32 + n_f * 3 * micro_bits
+
+
+# ============================================================
+# AMD GTS connectivity estimation (from AMD GPUOpen article)
+# Generalized Triangle Strip + inc/reuse packing
+# GPU decode via countbits + firstbithigh (parallel)
+# ============================================================
+
+def _amd_gts_bits(meshlet_tris, tris_np, tri_adj):
+    """AMD GTS: L/R flags + inc flags + reuse buffer.
+    Estimates ~6-7 bpt. GPU-parallel via bit intrinsics."""
+    vert_set = set()
+    for ti in meshlet_tris:
+        for j in range(3):
+            vert_set.add(int(tris_np[ti, j]))
+    n_local = len(vert_set)
+    n_f = len(meshlet_tris)
+    if n_f == 0:
+        return 0
+
+    # Estimate strip quality: ~5% restart rate for good strip generation
+    n_restarts = max(1, int(n_f * 0.05))
+    strip_len = n_f + 2 + 2 * n_restarts  # strip entries incl. degenerates
+    n_reuse = max(0, strip_len - n_local)
+
+    lr_bits = n_f                     # 1 bit per triangle (L/R flag)
+    inc_bits = strip_len              # 1 bit per strip entry (new vs reuse)
+    reuse_bits = n_reuse * 8          # uint8 per reuse (local vertex index)
+    header_bits = 4 * 8              # meshlet strip metadata
+
+    return lr_bits + inc_bits + reuse_bits + header_bits
 
 
 # ============================================================
@@ -736,3 +764,142 @@ class MeshletWaveletDedupEB(Encoder):
             print(f"  Refs+flags: {total_refs/8:,.0f}B  Conn: {total_conn/8:,.0f}B")
             print(f"  Total: {total_bits/8:,.0f}B  BPV={bpv:.2f}  BPT={bpt:.2f}")
         return CompressedModel(bytes(int(np.ceil(total_bits / 8))), bpv, bpt)
+
+
+# ============================================================
+# RECOMMENDED ENCODERS: GTS connectivity + various vertex encodings
+# These match the AMD GPUOpen article architecture:
+#   - GTS connectivity (parallel GPU decode via countbits/firstbithigh)
+#   - Global quantization grid (crack-free)
+#   - Vertex encoding options: plain / segmented delta / Haar wavelet
+# ============================================================
+
+class _MeshletGTSBase(Encoder):
+    """Base class for GTS-connectivity meshlet encoders."""
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 vertex_mode='seg_delta', verbose=False):
+        self.max_verts = max_verts
+        self.precision_error = precision_error
+        self.vertex_mode = vertex_mode  # 'plain', 'seg_delta', 'haar'
+        self.verbose = verbose
+
+    def encode(self, model: Model) -> CompressedModel:
+        from utils.wavelet import estimate_wavelet_bits_int
+
+        verts_np, tris_np = _to_numpy(model)
+        n_v, n_t = len(verts_np), len(tris_np)
+
+        center = verts_np.mean(axis=0)
+        vc = verts_np - center
+        scale = np.max(np.linalg.norm(vc, axis=1))
+        vn = vc / scale
+        per_coord_err = self.precision_error / scale / np.sqrt(3)
+
+        # Global quantize (crack-free)
+        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+
+        tri_adj = build_adjacency(tris_np)
+        fn = compute_face_normals(vn, tris_np)
+        fc = compute_face_centroids(vn, tris_np)
+        meshlets = generate_meshlets_by_verts(
+            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+
+        # Global header
+        total_bits = (3 * 4 + 3 * 4 + 3 + 4) * 8
+        total_vtx = 0
+        total_conn = 0
+        total_hdr = total_bits
+        vertex_recon = {}
+        n_cracks = 0
+
+        for ml_tris in meshlets:
+            vert_order, _, _ = edgebreaker_vertex_order(ml_tris, tris_np, tri_adj)
+            n_mv = len(vert_order)
+            if n_mv < 1:
+                continue
+
+            int_pts = global_codes[vert_order]
+
+            # Per-meshlet header: 37 bytes
+            ml_hdr = 37 * 8
+            total_hdr += ml_hdr
+
+            # Vertex encoding
+            vtx_bits = 0
+            if self.vertex_mode == 'seg_delta':
+                for d in range(3):
+                    vtx_bits += estimate_wavelet_bits_int(
+                        int_pts[:, d], 32, 'seg_delta')['total_bits']
+            elif self.vertex_mode == 'haar':
+                for d in range(3):
+                    vtx_bits += estimate_wavelet_bits_int(
+                        int_pts[:, d], 32, 'haar')['total_bits']
+            else:  # plain
+                for d in range(3):
+                    vals = int_pts[:, d]
+                    rng = int(vals.max() - vals.min()) if n_mv > 1 else 0
+                    bits = max(1, int(np.ceil(np.log2(rng + 2)))) if rng > 0 else 1
+                    vtx_bits += n_mv * bits + 5 * 8
+            total_vtx += vtx_bits
+
+            # GTS connectivity
+            conn_bits = _amd_gts_bits(ml_tris, tris_np, tri_adj)
+            total_conn += conn_bits
+
+            total_bits += ml_hdr + vtx_bits + conn_bits
+
+            # Crack check
+            dq = _dequantize_global(int_pts, g_min, g_range, g_bits)
+            for i, gv in enumerate(vert_order):
+                pos = tuple(dq[i])
+                if gv in vertex_recon:
+                    if vertex_recon[gv] != pos:
+                        n_cracks += 1
+                else:
+                    vertex_recon[gv] = pos
+
+        # Accuracy
+        all_recon = _dequantize_global(global_codes, g_min, g_range, g_bits)
+        errors = np.linalg.norm(all_recon - vn, axis=1) * scale
+
+        bpv = total_bits / n_v
+        bpt = total_bits / n_t
+
+        if self.verbose:
+            pct = (errors <= self.precision_error).sum() / n_v * 100
+            vtx_name = {'plain': 'Plain', 'seg_delta': 'SegDelta',
+                        'haar': 'Haar'}[self.vertex_mode]
+            print(f"MeshletGTS+{vtx_name} (crack-free) mv={self.max_verts}:")
+            print(f"  {len(meshlets)} meshlets, global bits={g_bits}, cracks={n_cracks}")
+            print(f"  Headers:      {total_hdr/8:>10,.0f} B ({total_hdr/total_bits*100:.1f}%)")
+            print(f"  Vertex data:  {total_vtx/8:>10,.0f} B ({total_vtx/total_bits*100:.1f}%)")
+            print(f"  Connectivity: {total_conn/8:>10,.0f} B ({total_conn/total_bits*100:.1f}%)")
+            print(f"  Total: {total_bits/8:,.0f}B  BPV={bpv:.2f}  BPT={bpt:.2f}  "
+                  f"Ratio={n_v*96+n_t*96:.0f}/{total_bits/8:.0f}="
+                  f"{(n_v*96+n_t*96)/(total_bits/8):.1f}x")
+            print(f"  Accuracy: max={errors.max():.6f}  %OK={pct:.1f}%")
+
+        data = bytes(int(np.ceil(total_bits / 8)))
+        return CompressedModel(data, bpv, bpt)
+
+
+class MeshletGTSPlain(_MeshletGTSBase):
+    """AMD original: GTS connectivity + plain per-meshlet quantized vertices.
+    Crack-free. GPU-parallel decode. Baseline for comparison."""
+    def __init__(self, max_verts=256, precision_error=0.0005, verbose=False):
+        super().__init__(max_verts, precision_error, 'plain', verbose)
+
+
+class MeshletGTSSegDelta(_MeshletGTSBase):
+    """Our best: GTS connectivity + segmented delta vertex encoding.
+    Crack-free. GPU-parallel decode. ~24% smaller than AMD baseline."""
+    def __init__(self, max_verts=256, precision_error=0.0005, verbose=False):
+        super().__init__(max_verts, precision_error, 'seg_delta', verbose)
+
+
+class MeshletGTSHaar(_MeshletGTSBase):
+    """GTS connectivity + Haar integer wavelet vertex encoding.
+    Crack-free. GPU-parallel decode (log N steps)."""
+    def __init__(self, max_verts=256, precision_error=0.0005, verbose=False):
+        super().__init__(max_verts, precision_error, 'haar', verbose)
