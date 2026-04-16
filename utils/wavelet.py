@@ -6,6 +6,95 @@ GPU-friendly parallel reduction: O(log N) decode steps.
 import numpy as np
 
 
+def lod_position_order(n_positions, target_base=32):
+    """Return array positions in LOD priority order.
+
+    The Haar wavelet base (of size target_base) reconstructs values at
+    array positions with stride = n_padded / target_base. Subsequent LOD
+    levels fill in positions at half the stride.
+
+    For n_padded=256, target_base=32, L=3 levels:
+      LOD 0 positions (stride 8): 0, 8, 16, ..., 248  (32 positions)
+      LOD 1 positions (stride 4): 4, 12, 20, ..., 252 (32 positions)
+      LOD 2 positions (stride 2): 2, 6, 10, ..., 254  (64 positions)
+      LOD 3 positions (stride 1): 1, 3, 5, ..., 255   (128 positions)
+
+    Returns:
+        positions: list[int] — ordered so that positions[:target_base]
+                   are LOD 0, positions[target_base:2*target_base] are LOD 1, etc.
+        lod_boundaries: list[int] — cumulative sizes [target_base, 2*tb, 4*tb, ...]
+                        marking where each LOD level ends in the positions list.
+    """
+    # Pad up to power of 2
+    n_padded = 1
+    while n_padded < n_positions:
+        n_padded *= 2
+    n_padded = max(n_padded, target_base)
+
+    L = 0
+    base = target_base
+    while base < n_padded:
+        base *= 2
+        L += 1
+    # L = number of wavelet levels (and number of LOD refinements)
+
+    # Bucket positions by LOD level based on trailing zeros
+    # Position p belongs to LOD k where k = L - tz(p), clamped to [0, L]
+    # with tz(0) treated as infinity (so pos 0 is in LOD 0)
+    lod_buckets = [[] for _ in range(L + 1)]
+    for p in range(n_padded):
+        if p == 0:
+            lod_buckets[0].append(p)
+        else:
+            tz = 0
+            x = p
+            while (x & 1) == 0:
+                tz += 1
+                x >>= 1
+            lvl = max(0, L - tz)
+            lod_buckets[lvl].append(p)
+
+    positions = []
+    lod_boundaries = []
+    for bucket in lod_buckets:
+        for p in bucket:
+            if p < n_positions:
+                positions.append(p)
+        lod_boundaries.append(len(positions))
+
+    return positions, lod_boundaries
+
+
+def place_by_importance(values_ranked, n_positions, target_base=32):
+    """Place importance-ranked values at LOD-priority positions.
+
+    Args:
+        values_ranked: 1D array of length n_positions, index 0 = most important
+        n_positions: total number of positions (meshlet vertex count)
+        target_base: wavelet base size
+
+    Returns:
+        arranged: (n_padded,) array with values at their LOD positions,
+                  padded to next power of 2 with last value repeated
+        positions: the LOD-ordered positions used (length n_positions)
+    """
+    positions, _ = lod_position_order(n_positions, target_base)
+    n_padded = 1
+    while n_padded < max(n_positions, target_base):
+        n_padded *= 2
+    arranged = np.zeros(n_padded, dtype=values_ranked.dtype)
+    for rank, pos in enumerate(positions):
+        arranged[pos] = values_ranked[rank]
+    # Pad unused positions with repeats of the last defined value
+    # (helps compression; any padding value works since it's known)
+    if len(positions) < n_padded:
+        fill = values_ranked[-1] if len(values_ranked) > 0 else 0
+        for p in range(n_padded):
+            if p not in set(positions):
+                arranged[p] = fill
+    return arranged, positions
+
+
 def haar_decompose(values, target_base=32):
     """Lazy Haar wavelet decomposition.
     Repeatedly: keep even-indexed, store (odd - even) as detail.

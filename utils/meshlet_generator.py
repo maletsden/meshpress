@@ -366,3 +366,117 @@ def edgebreaker_vertex_order(meshlet_tris, tris_np, tri_adj):
             seen.add(v)
 
     return vertex_order, opcodes, n_root
+
+
+# ============================================================
+# LOD-aware meshlet generation
+# ============================================================
+
+def generate_meshlets_lod(tris_np, tri_adj, face_normals, face_centroids,
+                          importance_rank, max_verts=256,
+                          w_normal=0.5, w_edges=0.25, w_dist=0.1, w_importance=0.15):
+    """Greedy region growing with importance-coherence bias.
+
+    Args:
+        importance_rank: dict or array mapping global vertex id → rank (0 = most important).
+            Meshlets will prefer to group vertices with similar importance.
+    """
+    n = len(tris_np)
+    visited = np.zeros(n, dtype=bool)
+    meshlets = []
+
+    # Pre-compute per-face average importance rank
+    face_imp = np.zeros(n, dtype=np.float64)
+    max_rank = max(importance_rank.values()) if isinstance(importance_rank, dict) else len(importance_rank) - 1
+    max_rank = max(max_rank, 1)
+    for fi in range(n):
+        s = 0.0
+        for j in range(3):
+            v = int(tris_np[fi, j])
+            r = importance_rank[v] if isinstance(importance_rank, dict) else importance_rank[v]
+            s += r
+        face_imp[fi] = s / 3.0 / max_rank   # normalized [0, 1]
+
+    for seed in range(n):
+        if visited[seed]:
+            continue
+
+        visited[seed] = True
+        ml_tris = [seed]
+        ml_verts = set(int(v) for v in tris_np[seed])
+        ml_set = {seed}
+        avg_normal = face_normals[seed].copy()
+        avg_centroid = face_centroids[seed].copy()
+        avg_imp = face_imp[seed]
+
+        pq = []
+        counter = 0
+
+        def push_neighbors(tri):
+            nonlocal counter
+            norm_len = np.linalg.norm(avg_normal)
+            unit_normal = avg_normal / (norm_len + 1e-12)
+            for nb in tri_adj[tri]:
+                if not visited[nb]:
+                    n_sim = (np.dot(face_normals[nb], unit_normal) + 1) / 2
+                    shared = sum(1 for nn in tri_adj[nb] if nn in ml_set) / 3.0
+                    dist = np.linalg.norm(face_centroids[nb] - avg_centroid)
+                    d_score = 1.0 / (1.0 + dist * 10)
+                    imp_coherence = 1.0 - abs(face_imp[nb] - avg_imp)
+                    score = (w_normal * n_sim + w_edges * shared +
+                             w_dist * d_score + w_importance * imp_coherence)
+                    heapq.heappush(pq, (-score, counter, nb))
+                    counter += 1
+
+        push_neighbors(seed)
+
+        while pq and len(ml_verts) < max_verts:
+            _, _, cand = heapq.heappop(pq)
+            if visited[cand]:
+                continue
+
+            new_verts = set(int(v) for v in tris_np[cand]) - ml_verts
+            if len(ml_verts) + len(new_verts) > max_verts:
+                continue
+
+            visited[cand] = True
+            ml_tris.append(cand)
+            ml_set.add(cand)
+            ml_verts.update(new_verts)
+
+            cnt = len(ml_tris)
+            avg_normal = (avg_normal * (cnt - 1) + face_normals[cand]) / cnt
+            avg_centroid = (avg_centroid * (cnt - 1) + face_centroids[cand]) / cnt
+            avg_imp = (avg_imp * (cnt - 1) + face_imp[cand]) / cnt
+
+            push_neighbors(cand)
+
+        meshlets.append(ml_tris)
+
+    return meshlets
+
+
+def reorder_meshlet_vertices_by_importance(meshlet_tris, tris_np, importance_rank):
+    """Sort a meshlet's vertices by importance (most important first).
+
+    This ensures that after Haar wavelet decomposition with target_base=32:
+      - First 32 vertices (base) = most important = LOD 0
+      - Next 32 (level 3 detail) → LOD 1 (64 verts)
+      - Next 64 (level 2 detail) → LOD 2 (128 verts)
+      - Next 128 (level 1 detail) → LOD 3 (256 verts)
+
+    Args:
+        importance_rank: dict or array mapping global vid → rank (0 = most important)
+
+    Returns:
+        vertex_order: list of global vertex ids sorted by importance
+    """
+    ml_verts = set()
+    for ti in meshlet_tris:
+        for j in range(3):
+            ml_verts.add(int(tris_np[ti, j]))
+
+    def rank_of(v):
+        return importance_rank[v] if isinstance(importance_rank, dict) else importance_rank[v]
+
+    return sorted(ml_verts, key=rank_of)

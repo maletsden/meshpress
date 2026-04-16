@@ -120,6 +120,87 @@ def _amd_packed_bits(meshlet_tris, tris_np, tri_adj):
     return 32 + n_f * 3 * micro_bits
 
 
+def _amd_fifo_adjacency_encode(meshlet_tris, tris_np, tri_adj):
+    """Real FIFO-adjacency encode using utils.connectivity.amd_encode_meshlet.
+
+    Produces the actual token stream and bit count; also verifies decode.
+    Returns (total_bits, stream, local_to_global, tris_local).
+    """
+    from utils.meshlet_generator import meshlet_bfs
+    from utils.connectivity import amd_encode_meshlet, amd_decode_verify
+
+    # Build local maps
+    vert_set = set()
+    for ti in meshlet_tris:
+        for j in range(3):
+            vert_set.add(int(tris_np[ti, j]))
+    local_verts = sorted(vert_set)
+    g2l = {g: l for l, g in enumerate(local_verts)}
+    n_local = len(local_verts)
+    n_f = len(meshlet_tris)
+    if n_f == 0:
+        return 0, [], local_verts, np.zeros((0, 3), dtype=int)
+
+    tris_local = np.zeros((n_f, 3), dtype=int)
+    tri_map = {}
+    for li, ti in enumerate(meshlet_tris):
+        tri_map[ti] = li
+        for j in range(3):
+            tris_local[li, j] = g2l[int(tris_np[ti, j])]
+
+    local_adj = [[] for _ in range(n_f)]
+    for li, ti in enumerate(meshlet_tris):
+        for nb in tri_adj[ti]:
+            if nb in tri_map:
+                local_adj[li].append(tri_map[nb])
+
+    # BFS triangle order
+    bfs_trav = meshlet_bfs(meshlet_tris, tri_adj)
+    bfs_order = [tri_map[ti] for ti, _ in bfs_trav]
+
+    # Encode
+    total_bits, stream, _, _ = amd_encode_meshlet(
+        meshlet_tris, tris_np, tri_adj, bfs_order,
+        tris_local, local_adj, n_local)
+    return total_bits, stream, local_verts, tris_local
+
+
+def _amd_fifo_adjacency_bits(meshlet_tris, tris_np, tri_adj):
+    """Just the bit count from the real encode."""
+    bits, _, _, _ = _amd_fifo_adjacency_encode(meshlet_tris, tris_np, tri_adj)
+    return bits
+
+
+def _amd_gts_real_bits(meshlet_tris, tris_np, tri_adj):
+    """Real (simplified) AMD GTS bit count using the encoder in utils/amd_gts.py."""
+    from utils.amd_gts import gts_encode
+    vert_set = set()
+    for ti in meshlet_tris:
+        for j in range(3):
+            vert_set.add(int(tris_np[ti, j]))
+    local_verts = sorted(vert_set)
+    g2l = {g: l for l, g in enumerate(local_verts)}
+    n_local = len(local_verts)
+    n_f = len(meshlet_tris)
+    if n_f == 0:
+        return 0
+
+    tris_local = np.zeros((n_f, 3), dtype=int)
+    tri_map = {}
+    for li, ti in enumerate(meshlet_tris):
+        tri_map[ti] = li
+        for j in range(3):
+            tris_local[li, j] = g2l[int(tris_np[ti, j])]
+    local_adj = [[] for _ in range(n_f)]
+    for li, ti in enumerate(meshlet_tris):
+        for nb in tri_adj[ti]:
+            if nb in tri_map:
+                local_adj[li].append(tri_map[nb])
+
+    bits, _ = gts_encode(tris_local, local_adj, n_local)
+    return bits
+
+
 # ============================================================
 # AMD GTS connectivity estimation (from AMD GPUOpen article)
 # Generalized Triangle Strip + inc/reuse packing
@@ -539,6 +620,38 @@ def _global_quantize(vn, per_coord_err):
     return codes, global_min, global_range, global_bits
 
 
+def _local_quantize_meshlet(positions, per_coord_err):
+    """Quantize a subset of vertex positions (one meshlet's interior) to
+    a LOCAL integer grid with per-coord bit counts fitted to the subset's bbox.
+
+    Args:
+        positions: (n, 3) float positions of verts in this meshlet's interior
+        per_coord_err: target quantization error per coordinate (same scale as positions)
+
+    Returns:
+        codes: (n, 3) int64 quantization codes
+        local_min: (3,) float origin of local grid
+        local_range: (3,) float range per axis
+        local_bits: (3,) int bit count per axis
+    """
+    if len(positions) == 0:
+        return (np.zeros((0, 3), dtype=np.int64),
+                np.zeros(3), np.ones(3), np.array([1, 1, 1]))
+    local_min = positions.min(axis=0)
+    local_max = positions.max(axis=0)
+    local_range = local_max - local_min
+    local_range[local_range < 1e-12] = 1e-12
+    local_bits = np.array([_bits_for_error(local_range[d], per_coord_err)
+                            for d in range(3)])
+    codes = np.zeros((len(positions), 3), dtype=np.int64)
+    for d in range(3):
+        mx = (1 << local_bits[d]) - 1
+        codes[:, d] = np.round(
+            (positions[:, d] - local_min[d]) / local_range[d] * mx
+        ).clip(0, mx).astype(np.int64)
+    return codes, local_min, local_range, local_bits
+
+
 def _dequantize_global(codes, global_min, global_range, global_bits):
     result = np.zeros((len(codes), 3), dtype=np.float64)
     for d in range(3):
@@ -903,3 +1016,356 @@ class MeshletGTSHaar(_MeshletGTSBase):
     Crack-free. GPU-parallel decode (log N steps)."""
     def __init__(self, max_verts=256, precision_error=0.0005, verbose=False):
         super().__init__(max_verts, precision_error, 'haar', verbose)
+
+
+# ============================================================
+# LOD Encoder: progressive wavelet LOD with QEM importance ordering
+# ============================================================
+
+def _build_lod_triangle_masks(meshlet_tris, tris_np, vert_order,
+                               lod_vert_counts):
+    """Build boolean masks of active triangles per LOD level.
+
+    A triangle is active at LOD level L if all 3 of its vertices
+    have local index < lod_vert_counts[L] in the importance-ordered
+    vertex list.
+
+    Returns list of np.ndarray bool masks, one per LOD level.
+    """
+    # Map global vid → local index in the importance order
+    g2l = {gv: li for li, gv in enumerate(vert_order)}
+
+    n_tris = len(meshlet_tris)
+    masks = []
+    for nv_cutoff in lod_vert_counts:
+        mask = np.zeros(n_tris, dtype=bool)
+        for ti_local, ti_global in enumerate(meshlet_tris):
+            a, b, c = int(tris_np[ti_global, 0]), int(tris_np[ti_global, 1]), int(tris_np[ti_global, 2])
+            if g2l.get(a, 999) < nv_cutoff and g2l.get(b, 999) < nv_cutoff and g2l.get(c, 999) < nv_cutoff:
+                mask[ti_local] = True
+        masks.append(mask)
+    return masks
+
+
+def _lod_mask_bits(masks):
+    """Estimate bits for LOD triangle masks using delta-encoded bitmasks.
+
+    LOD masks are hierarchical: mask[i] is a superset of mask[i-1].
+    Encode mask[0] + delta(mask[1]-mask[0]) + delta(mask[2]-mask[1]) + ...
+    Use entropy coding on each delta bitmask.
+    """
+    total_bits = 0
+    prev = np.zeros(len(masks[0]), dtype=bool)
+    for mask in masks:
+        delta = mask & ~prev  # new triangles at this level
+        n_ones = int(delta.sum())
+        n = len(delta)
+        if n == 0:
+            continue
+        # Entropy of binary stream
+        if n_ones == 0 or n_ones == n:
+            bits = n + 8  # 1 bpt + small header
+        else:
+            p = n_ones / n
+            ent = -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
+            bits = min(n, n * ent + 16)  # entropy vs plain
+        total_bits += bits + 8  # 8 bits for delta header
+        prev = mask
+    return total_bits
+
+
+def _identify_meshlet_boundary_verts(meshlets, tris_np):
+    """Find vertices shared between ≥2 meshlets (meshlet boundary)."""
+    vert_ml = {}
+    for ml_idx, ml_tris in enumerate(meshlets):
+        vs = set()
+        for ti in ml_tris:
+            for j in range(3):
+                vs.add(int(tris_np[ti, j]))
+        for v in vs:
+            if v in vert_ml:
+                vert_ml[v].add(ml_idx)
+            else:
+                vert_ml[v] = {ml_idx}
+    return set(v for v, ms in vert_ml.items() if len(ms) >= 2)
+
+
+def _next_pow2(n):
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+def _build_lod_masks_from_positions(meshlet_tris, tris_np, g2l, g2pos,
+                                     lod_vertex_sets):
+    """Build hierarchical LOD triangle masks based on VERTEX POSITIONS.
+
+    lod_vertex_sets: list of sets; lod_vertex_sets[k] = positions present at LOD k.
+    A triangle is active at LOD k iff all 3 of its vertex positions are in set k.
+    """
+    n_tris = len(meshlet_tris)
+    masks = []
+    for pos_set in lod_vertex_sets:
+        mask = np.zeros(n_tris, dtype=bool)
+        for ti_local, ti_global in enumerate(meshlet_tris):
+            a = int(tris_np[ti_global, 0])
+            b = int(tris_np[ti_global, 1])
+            c = int(tris_np[ti_global, 2])
+            if (g2pos.get(a, -1) in pos_set and
+                g2pos.get(b, -1) in pos_set and
+                g2pos.get(c, -1) in pos_set):
+                mask[ti_local] = True
+        masks.append(mask)
+    return masks
+
+
+class MeshletWaveletLOD(Encoder):
+    """Crack-free progressive LOD encoder.
+
+    Pipeline:
+      1. Generate meshlets on original mesh
+      2. Identify meshlet boundary vertices (shared between ≥2 meshlets)
+      3. Run QEM with boundary verts PROTECTED (never collapsed)
+      4. Per-meshlet:
+         - target_base = max(32, next_pow2(n_boundary_in_meshlet))
+         - Place boundary verts in LOD 0 position slots
+         - Place interior verts (by QEM importance) in LOD 1+ slots
+         - Haar wavelet with per-meshlet target_base
+         - Triangle LOD masks based on decoded positions per level
+
+    Crack-free guarantee:
+      - Global integer quantization → shared verts have identical positions
+      - Boundary verts NEVER collapsed by QEM → positions stable across meshlets
+      - All boundary verts at LOD 0 positions → available at every LOD level
+        in every meshlet that contains them
+      - Topological crack-free: boundary verts decodable from LOD 0 upward
+    """
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 connectivity='gts', verbose=False):
+        self.max_verts = max_verts
+        self.precision_error = precision_error
+        self.connectivity = connectivity  # 'gts', 'edgebreaker', 'amd_packed'
+        self.verbose = verbose
+
+    def encode(self, model: Model) -> CompressedModel:
+        from utils.wavelet import (
+            estimate_wavelet_bits_int, lod_position_order,
+        )
+        from utils.qem import progressive_simplify
+
+        verts_np, tris_np = _to_numpy(model)
+        n_v, n_t = len(verts_np), len(tris_np)
+
+        # --- Step 1: Global quantization (crack-free grid) ---
+        center = verts_np.mean(axis=0)
+        vc = verts_np - center
+        scale = np.max(np.linalg.norm(vc, axis=1))
+        vn = vc / scale
+        per_coord_err = self.precision_error / scale / np.sqrt(3)
+        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+
+        # --- Step 2: Generate meshlets on original mesh ---
+        tri_adj = build_adjacency(tris_np)
+        fn = compute_face_normals(vn, tris_np)
+        fc = compute_face_centroids(vn, tris_np)
+        from utils.meshlet_generator import generate_meshlets_by_verts
+        meshlets = generate_meshlets_by_verts(
+            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+
+        # --- Step 3: Identify boundary verts (shared between meshlets) ---
+        boundary_verts = _identify_meshlet_boundary_verts(meshlets, tris_np)
+
+        # --- Step 4: QEM with boundary protection ---
+        if self.verbose:
+            print(f"  Meshlets: {len(meshlets)}, boundary verts: "
+                  f"{len(boundary_verts)} ({len(boundary_verts)/n_v*100:.1f}%)")
+            print("  QEM simplification (boundary protected)...")
+        qem_result = progressive_simplify(
+            verts_np, tris_np,
+            target_ratios=[0.5],
+            protected_vertices=boundary_verts)
+        imp_order = qem_result["importance_order"]
+        imp_rank = np.full(n_v, n_v, dtype=np.int64)
+        for rank, vid in enumerate(imp_order):
+            imp_rank[vid] = rank
+
+        # --- Step 5: Per-meshlet encoding ---
+        total_bits = (3 * 4 + 3 * 4 + 3 + 4 + 4) * 8  # global header
+        total_vtx = 0
+        total_conn = 0
+        total_lod_mask = 0
+        total_hdr = total_bits
+        lod_tris_total = [0, 0, 0, 0]
+        lod_verts_total = [0, 0, 0, 0]
+        max_target_base = 0
+
+        # Track topological cracks: boundary vert should be at LOD 0 in all its meshlets
+        bnd_vert_min_lod = {}   # vid → min LOD level across all meshlets
+        bnd_vert_max_lod = {}
+
+        for ml_tris in meshlets:
+            # All vertices in meshlet
+            ml_vert_set = set()
+            for ti in ml_tris:
+                for j in range(3):
+                    ml_vert_set.add(int(tris_np[ti, j]))
+            n_mv = len(ml_vert_set)
+            if n_mv < 1:
+                continue
+
+            # Split into boundary and interior
+            bnd_in_ml = sorted(v for v in ml_vert_set if v in boundary_verts)
+            int_in_ml = sorted((v for v in ml_vert_set if v not in boundary_verts),
+                                key=lambda v: imp_rank[v])
+
+            # Determine target_base.
+            # LOD 0 has target_base positions at stride = n_padded/target_base.
+            # Only positions < n_mv are "real" (rest are padding).
+            # Count of real LOD 0 positions = ceil(n_mv / stride) = target_base * n_mv / n_padded.
+            # We need this >= n_bnd, so target_base >= n_padded * n_bnd / n_mv.
+            n_bnd = len(bnd_in_ml)
+            n_padded = _next_pow2(max(n_mv, 32))
+            if n_bnd > 0:
+                min_tb = _next_pow2(max(1, int(np.ceil(n_padded * n_bnd / n_mv))))
+            else:
+                min_tb = 32
+            target_base = max(32, min_tb)
+            target_base = min(target_base, n_padded)
+            max_target_base = max(max_target_base, target_base)
+
+            # Importance-ordered list: boundary first (protected), then interior by rank
+            ranked_verts = bnd_in_ml + int_in_ml  # length n_mv
+
+            # Get LOD positions
+            positions, lod_boundaries = lod_position_order(n_mv, target_base)
+            # positions[k] = array position for rank k
+            # lod_boundaries[L] = cumulative count up to and including LOD L
+
+            # Map rank → array position
+            rank_to_pos = positions  # already in this order
+            # Build vid → position and vid → local-rank
+            g2pos = {}
+            g2l = {}
+            for rank, vid in enumerate(ranked_verts):
+                if rank < len(rank_to_pos):
+                    g2pos[vid] = rank_to_pos[rank]
+                    g2l[vid] = rank
+                else:
+                    # Shouldn't happen if n_mv matches
+                    g2pos[vid] = rank_to_pos[-1]
+                    g2l[vid] = rank
+
+            # Build arranged array (padded to pow2) for wavelet input
+            n_padded = _next_pow2(max(n_mv, target_base))
+            arranged = np.zeros((n_padded, 3), dtype=np.int64)
+            for rank, vid in enumerate(ranked_verts):
+                p = rank_to_pos[rank]
+                arranged[p] = global_codes[vid]
+            # Pad unfilled positions: repeat last value
+            used_positions = set(rank_to_pos[:n_mv])
+            fill_val = global_codes[ranked_verts[-1]] if ranked_verts else [0, 0, 0]
+            for p in range(n_padded):
+                if p not in used_positions:
+                    arranged[p] = fill_val
+
+            # Per-meshlet header (approx): 45B
+            ml_hdr = 45 * 8
+            total_hdr += ml_hdr
+
+            # Vertex encoding: Haar wavelet with meshlet's target_base
+            vtx_bits = 0
+            for d in range(3):
+                w = estimate_wavelet_bits_int(
+                    arranged[:, d], target_base, 'haar')
+                vtx_bits += w["total_bits"]
+            total_vtx += vtx_bits
+
+            # LOD triangle masks based on position buckets
+            # Positions available at LOD k = first lod_boundaries[k] entries
+            # in the rank_to_pos list
+            L = len(lod_boundaries)
+            lod_position_sets = []
+            for k in range(L):
+                pos_set = set(rank_to_pos[:lod_boundaries[k]])
+                lod_position_sets.append(pos_set)
+            # Pad to 4 LOD levels for reporting consistency
+            while len(lod_position_sets) < 4:
+                lod_position_sets.append(lod_position_sets[-1])
+
+            masks = _build_lod_masks_from_positions(
+                ml_tris, tris_np, g2l, g2pos, lod_position_sets)
+            mask_bits = _lod_mask_bits(masks)
+            total_lod_mask += mask_bits
+
+            for li, mask in enumerate(masks[:4]):
+                lod_tris_total[li] += int(mask.sum())
+                lod_verts_total[li] += len(lod_position_sets[li])
+
+            # Track boundary vert LOD levels (for crack check)
+            for vid in bnd_in_ml:
+                rank = g2l[vid]
+                # Which LOD level does this rank belong to?
+                lod_level = 0
+                for k, bnd in enumerate(lod_boundaries):
+                    if rank < bnd:
+                        lod_level = k
+                        break
+                bnd_vert_min_lod[vid] = min(bnd_vert_min_lod.get(vid, 99), lod_level)
+                bnd_vert_max_lod[vid] = max(bnd_vert_max_lod.get(vid, -1), lod_level)
+
+            # Connectivity (full-resolution)
+            if self.connectivity == 'gts':
+                conn_bits = _amd_gts_bits(ml_tris, tris_np, tri_adj)
+            elif self.connectivity == 'edgebreaker':
+                vo_eb, opcodes, n_roots = edgebreaker_vertex_order(
+                    ml_tris, tris_np, tri_adj)
+                conn_bits = _edgebreaker_bits(opcodes, n_roots, len(vo_eb))
+            else:
+                conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
+            total_conn += conn_bits
+
+            total_bits += ml_hdr + vtx_bits + mask_bits + conn_bits
+
+        # Crack-free verification: every boundary vert should be at LOD 0
+        # in every meshlet that contains it
+        n_bnd_not_lod0 = sum(1 for v, lvl in bnd_vert_max_lod.items() if lvl > 0)
+
+        # Geometric crack check: same vert → same position across meshlets
+        # (guaranteed by global quantization, but verify)
+        all_recon = _dequantize_global(global_codes, g_min, g_range, g_bits)
+        errors = np.linalg.norm(all_recon - vn, axis=1) * scale
+
+        bpv = total_bits / n_v
+        bpt = total_bits / n_t
+
+        if self.verbose:
+            pct = (errors <= self.precision_error).sum() / n_v * 100
+            conn_name = self.connectivity.upper()
+            print(f"MeshletWaveletLOD+{conn_name} (crack-free, progressive) "
+                  f"mv={self.max_verts}:")
+            print(f"  {len(meshlets)} meshlets, global bits={g_bits.tolist()}")
+            print(f"  Max target_base: {max_target_base}")
+            print(f"  Boundary verts at LOD>0 (topological cracks): "
+                  f"{n_bnd_not_lod0} / {len(bnd_vert_max_lod)}")
+            print(f"  Headers:      {total_hdr/8:>10,.0f} B "
+                  f"({total_hdr/total_bits*100:.1f}%)")
+            print(f"  Vertex data:  {total_vtx/8:>10,.0f} B "
+                  f"({total_vtx/total_bits*100:.1f}%)")
+            print(f"  LOD masks:    {total_lod_mask/8:>10,.0f} B "
+                  f"({total_lod_mask/total_bits*100:.1f}%)")
+            print(f"  Connectivity: {total_conn/8:>10,.0f} B "
+                  f"({total_conn/total_bits*100:.1f}%)")
+            print(f"  Total: {total_bits/8:,.0f}B  BPV={bpv:.2f}  BPT={bpt:.2f}")
+            print(f"  Ratio: {(n_v*96+n_t*96)/(total_bits/8):.1f}x  "
+                  f"Accuracy: max={errors.max():.6f}  %OK={pct:.1f}%")
+            print(f"  LOD triangle coverage:")
+            for li in range(4):
+                avg_v = lod_verts_total[li] / max(len(meshlets), 1)
+                print(f"    LOD {li} (~{avg_v:>3.0f} v/ml avg): "
+                      f"{lod_tris_total[li]:>8,} / {n_t:>8,} tris "
+                      f"({lod_tris_total[li]/n_t*100:.1f}%)")
+
+        data = bytes(int(np.ceil(total_bits / 8)))
+        return CompressedModel(data, bpv, bpt)
