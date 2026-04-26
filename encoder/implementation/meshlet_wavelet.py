@@ -1183,7 +1183,7 @@ class MeshletSplitDiffQuantAMD(Encoder):
                  epochs=300, lr=5e-3,
                  lambda_rate=1.0, lambda_max=1e5, seed=0,
                  predictor_type="mlp",
-                 conn="gts_v3", sort="morton",
+                 conn="gts_v3", sort="greedy_nn",
                  target_base=32, verbose=False):
         self.max_verts = max_verts
         self.precision_error = precision_error
@@ -1236,9 +1236,12 @@ class MeshletSplitDiffQuantAMD(Encoder):
                 continue
             ltg, bnd_local, int_local, _ = split_meshlet_verts(
                 vert_order, boundary_set)
-            if self.sort == "morton":
+            if self.sort != "eb":
+                from utils.interior_sorts import sort_interior as _si
                 bnd_local = sort_by_morton(bnd_local, global_codes)
-                int_local = sort_by_morton(int_local, global_codes)
+                int_local = _si(self.sort, int_local,
+                                global_codes=global_codes,
+                                vert_pos_float=vn)
                 ltg = bnd_local + int_local
             meshlet_data.append((ml_tris, ltg, bnd_local, int_local))
             if len(int_local) > 0:
@@ -1376,7 +1379,7 @@ class MeshletSplitMLPAMD(Encoder):
                  kernel_size=4, hidden=16,
                  ratio_candidates=(2.0, 4.0, 6.0, 8.0, 12.0, 16.0),
                  epochs=300, lr=1e-3, weight_decay=1e-4, seed=0,
-                 conn="gts_v3", sort="morton",
+                 conn="gts_v3", sort="greedy_nn",
                  target_base=32, verbose=False):
         self.max_verts = max_verts
         self.precision_error = precision_error
@@ -1433,9 +1436,12 @@ class MeshletSplitMLPAMD(Encoder):
                 continue
             ltg, bnd_local, int_local, _ = split_meshlet_verts(
                 vert_order, boundary_set)
-            if self.sort == "morton":
+            if self.sort != "eb":
+                from utils.interior_sorts import sort_interior as _si
                 bnd_local = sort_by_morton(bnd_local, global_codes)
-                int_local = sort_by_morton(int_local, global_codes)
+                int_local = _si(self.sort, int_local,
+                                global_codes=global_codes,
+                                vert_pos_float=vn)
                 ltg = bnd_local + int_local
             meshlet_data.append((ml_tris, ltg, bnd_local, int_local))
             if len(int_local) > 0:
@@ -1602,7 +1608,7 @@ class MeshletSplitLearnedAMD(Encoder):
 
     def __init__(self, max_verts=256, precision_error=0.0005,
                  schedule="geometric", ratio=2.0, kernel_size=4,
-                 conn="gts_v3", sort="morton", pack_meta=True,
+                 conn="gts_v3", sort="greedy_nn", pack_meta=True,
                  target_base=32, verbose=False):
         self.max_verts = max_verts
         self.precision_error = precision_error
@@ -1656,9 +1662,12 @@ class MeshletSplitLearnedAMD(Encoder):
                 continue
             ltg, bnd_local, int_local, _ = split_meshlet_verts(
                 vert_order, boundary_set)
-            if self.sort == "morton":
+            if self.sort != "eb":
+                from utils.interior_sorts import sort_interior as _si
                 bnd_local = sort_by_morton(bnd_local, global_codes)
-                int_local = sort_by_morton(int_local, global_codes)
+                int_local = _si(self.sort, int_local,
+                                global_codes=global_codes,
+                                vert_pos_float=vn)
                 ltg = bnd_local + int_local
             meshlet_data.append((ml_tris, ltg, bnd_local, int_local))
             if len(int_local) > 0:
