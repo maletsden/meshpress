@@ -1184,7 +1184,8 @@ class MeshletSplitDiffQuantAMD(Encoder):
                  lambda_rate=1.0, lambda_max=1e5, seed=0,
                  predictor_type="mlp",
                  conn="gts_v3", sort="greedy_nn",
-                 target_base=32, verbose=False):
+                 target_base=32, dct_block_size=4,
+                 dct_schedule="uniform", dct_ratio=2.0, verbose=False):
         self.max_verts = max_verts
         self.precision_error = precision_error
         self.kernel_size = kernel_size
@@ -1198,6 +1199,11 @@ class MeshletSplitDiffQuantAMD(Encoder):
         self.conn = conn
         self.sort = sort
         self.target_base = target_base
+        # Optional block-DCT alternative branch (per-meshlet 1-bit selector,
+        # same pattern as MeshletSplitFloatWaveletAMD's cycle-3 branch).
+        self.dct_block_size = dct_block_size
+        self.dct_schedule = dct_schedule
+        self.dct_ratio = dct_ratio
         self.verbose = verbose
 
     def encode(self, model: Model) -> CompressedModel:
@@ -1305,8 +1311,25 @@ class MeshletSplitDiffQuantAMD(Encoder):
             int_bits = 0
             if n_int > 0:
                 int_pts = vn[int_local]
-                int_recon, int_bits, _meta = quantize_interior_diff(
+                neural_recon, neural_bits, _meta = quantize_interior_diff(
                     int_pts, params, verbose=False)
+
+                if self.dct_block_size > 0:
+                    from utils.block_dct import quantize_interior_dct_packed
+                    dct_recon, dct_bits, _ = quantize_interior_dct_packed(
+                        int_pts, per_coord_err,
+                        block_size=self.dct_block_size,
+                        schedule=self.dct_schedule,
+                        ratio=self.dct_ratio,
+                    )
+                    # Per-meshlet 1-bit flag picks the smaller branch.
+                    if dct_bits + 1 < neural_bits + 1:
+                        int_recon, int_bits = dct_recon, dct_bits + 1
+                    else:
+                        int_recon, int_bits = neural_recon, neural_bits + 1
+                else:
+                    int_recon, int_bits = neural_recon, neural_bits
+
                 total_interior += int_bits
                 err = np.linalg.norm(int_recon - int_pts, axis=1) * scale
                 interior_errors.extend(err.tolist())
@@ -1380,7 +1403,8 @@ class MeshletSplitMLPAMD(Encoder):
                  ratio_candidates=(2.0, 4.0, 6.0, 8.0, 12.0, 16.0),
                  epochs=300, lr=1e-3, weight_decay=1e-4, seed=0,
                  conn="gts_v3", sort="greedy_nn",
-                 target_base=32, verbose=False):
+                 target_base=32, dct_block_size=4,
+                 dct_schedule="uniform", dct_ratio=2.0, verbose=False):
         self.max_verts = max_verts
         self.precision_error = precision_error
         self.kernel_size = kernel_size
@@ -1393,6 +1417,9 @@ class MeshletSplitMLPAMD(Encoder):
         self.conn = conn
         self.sort = sort
         self.target_base = target_base
+        self.dct_block_size = dct_block_size
+        self.dct_schedule = dct_schedule
+        self.dct_ratio = dct_ratio
         self.verbose = verbose
 
     def encode(self, model: Model) -> CompressedModel:
@@ -1527,11 +1554,25 @@ class MeshletSplitMLPAMD(Encoder):
             int_bits = 0
             if n_int > 0:
                 int_pts = vn[int_local]
-                int_recon, int_bits, _meta = quantize_interior_mlp_wavelet(
+                neural_recon, neural_bits, _meta = quantize_interior_mlp_wavelet(
                     int_pts, per_coord_err, mlp_weights, self.kernel_size,
                     amp=amp, schedule="geometric", ratio=best_ratio,
                     target_base=self.target_base,
                 )
+                if self.dct_block_size > 0:
+                    from utils.block_dct import quantize_interior_dct_packed
+                    dct_recon, dct_bits, _ = quantize_interior_dct_packed(
+                        int_pts, per_coord_err,
+                        block_size=self.dct_block_size,
+                        schedule=self.dct_schedule,
+                        ratio=self.dct_ratio,
+                    )
+                    if dct_bits + 1 < neural_bits + 1:
+                        int_recon, int_bits = dct_recon, dct_bits + 1
+                    else:
+                        int_recon, int_bits = neural_recon, neural_bits + 1
+                else:
+                    int_recon, int_bits = neural_recon, neural_bits
                 total_interior += int_bits
                 err = np.linalg.norm(int_recon - int_pts, axis=1) * scale
                 interior_errors.extend(err.tolist())
@@ -1607,9 +1648,10 @@ class MeshletSplitLearnedAMD(Encoder):
     """
 
     def __init__(self, max_verts=256, precision_error=0.0005,
-                 schedule="geometric", ratio=2.0, kernel_size=4,
+                 schedule="geometric", ratio=2.0, kernel_size=2,
                  conn="gts_v3", sort="greedy_nn", pack_meta=True,
-                 target_base=32, verbose=False):
+                 target_base=32, dct_block_size=4,
+                 dct_schedule="uniform", dct_ratio=2.0, verbose=False):
         self.max_verts = max_verts
         self.precision_error = precision_error
         self.schedule = schedule
@@ -1619,6 +1661,9 @@ class MeshletSplitLearnedAMD(Encoder):
         self.sort = sort
         self.pack_meta = pack_meta  # kept for API symmetry; layout is always packed
         self.target_base = target_base
+        self.dct_block_size = dct_block_size
+        self.dct_schedule = dct_schedule
+        self.dct_ratio = dct_ratio
         self.verbose = verbose
 
     def encode(self, model: Model) -> CompressedModel:
@@ -1711,11 +1756,25 @@ class MeshletSplitLearnedAMD(Encoder):
             int_bits = 0
             if n_int > 0:
                 int_pts = vn[int_local]
-                int_recon, int_bits, _meta = quantize_interior_learned_wavelet(
+                neural_recon, neural_bits, _meta = quantize_interior_learned_wavelet(
                     int_pts, per_coord_err, kernels,
                     schedule=self.schedule, ratio=self.ratio,
                     target_base=self.target_base, amp=amp,
                 )
+                if self.dct_block_size > 0:
+                    from utils.block_dct import quantize_interior_dct_packed
+                    dct_recon, dct_bits, _ = quantize_interior_dct_packed(
+                        int_pts, per_coord_err,
+                        block_size=self.dct_block_size,
+                        schedule=self.dct_schedule,
+                        ratio=self.dct_ratio,
+                    )
+                    if dct_bits + 1 < neural_bits + 1:
+                        int_recon, int_bits = dct_recon, dct_bits + 1
+                    else:
+                        int_recon, int_bits = neural_recon, neural_bits + 1
+                else:
+                    int_recon, int_bits = neural_recon, neural_bits
                 total_interior += int_bits
                 err = np.linalg.norm(int_recon - int_pts, axis=1) * scale
                 interior_errors.extend(err.tolist())
