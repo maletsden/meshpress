@@ -950,17 +950,25 @@ class MeshletSplitFloatWaveletAMD(Encoder):
 
     def __init__(self, max_verts=256, precision_error=0.0005,
                  wavelet="haar", schedule="geometric", ratio=2.0,
-                 conn="gts_v3", sort="morton", pack_meta=True,
-                 target_base=32, verbose=False):
+                 conn="gts_v3", sort="greedy_nn", pack_meta=True,
+                 target_base=32, dct_block_size=4,
+                 dct_schedule="uniform", dct_ratio=2.0, verbose=False):
         self.max_verts = max_verts
         self.precision_error = precision_error
         self.wavelet = wavelet
         self.schedule = schedule
         self.ratio = ratio
-        self.conn = conn  # 'packed' | 'gts' | 'gts_v2'
-        self.sort = sort  # 'eb' | 'morton'
+        self.conn = conn  # 'packed' | 'gts' | 'gts_v2' | 'gts_v3'
+        self.sort = sort  # 'eb' | 'morton' | 'hilbert' | 'pca' | 'greedy_nn'
         self.pack_meta = pack_meta  # True: 7B/level shared; False: 5B/stream
         self.target_base = target_base
+        # Optional block-DCT alternative to the wavelet on the interior stream.
+        # 0 disables (current baseline). If > 0, encodes each meshlet with
+        # both the wavelet AND a block-DCT variant, picks whichever gives the
+        # smaller bit cost, and prepends a 1-bit per-meshlet selector flag.
+        self.dct_block_size = dct_block_size
+        self.dct_schedule = dct_schedule
+        self.dct_ratio = dct_ratio
         self.verbose = verbose
 
     def encode(self, model: Model) -> CompressedModel:
@@ -1049,19 +1057,36 @@ class MeshletSplitFloatWaveletAMD(Encoder):
             ref_total = n_bnd * ref_bits
             total_bnd_refs += ref_total
 
-            # Interior float wavelet
+            # Interior float wavelet (optionally with block-DCT alternative)
             if n_int > 0:
                 int_pts = vn[int_local]
                 quant_fn = (quantize_interior_float_wavelet_packed
                             if self.pack_meta
                             else quantize_interior_float_wavelet)
-                int_recon, int_bits, _meta = quant_fn(
+                wave_recon, wave_bits, _meta = quant_fn(
                     int_pts, per_coord_err,
                     wavelet=self.wavelet,
                     schedule=self.schedule,
                     ratio=self.ratio,
                     target_base=self.target_base,
                 )
+
+                if self.dct_block_size > 0:
+                    from utils.block_dct import quantize_interior_dct_packed
+                    dct_recon, dct_bits, _ = quantize_interior_dct_packed(
+                        int_pts, per_coord_err,
+                        block_size=self.dct_block_size,
+                        schedule=self.dct_schedule,
+                        ratio=self.dct_ratio,
+                    )
+                    # Per-meshlet 1-bit flag picks the smaller branch.
+                    if dct_bits + 1 < wave_bits + 1:
+                        int_recon, int_bits = dct_recon, dct_bits + 1
+                    else:
+                        int_recon, int_bits = wave_recon, wave_bits + 1
+                else:
+                    int_recon, int_bits = wave_recon, wave_bits
+
                 total_interior += int_bits
                 # Measure real error in ORIGINAL (unnormalized) units
                 err = np.linalg.norm(int_recon - int_pts, axis=1) * scale
@@ -1127,12 +1152,16 @@ class MeshletSplitFloatHaarAMD(MeshletSplitFloatWaveletAMD):
 
     def __init__(self, max_verts=256, precision_error=0.0005,
                  schedule="geometric", ratio=2.0,
-                 conn="gts_v3", sort="morton", pack_meta=True,
-                 target_base=32, verbose=False):
+                 conn="gts_v3", sort="greedy_nn", pack_meta=True,
+                 target_base=32, dct_block_size=4,
+                 dct_schedule="uniform", dct_ratio=2.0, verbose=False):
         super().__init__(max_verts=max_verts, precision_error=precision_error,
                          wavelet="haar", schedule=schedule, ratio=ratio,
                          conn=conn, sort=sort, pack_meta=pack_meta,
-                         target_base=target_base, verbose=verbose)
+                         target_base=target_base,
+                         dct_block_size=dct_block_size,
+                         dct_schedule=dct_schedule, dct_ratio=dct_ratio,
+                         verbose=verbose)
 
 
 class MeshletSplitDiffQuantAMD(Encoder):
@@ -1741,12 +1770,16 @@ class MeshletSplitFloatCDF53AMD(MeshletSplitFloatWaveletAMD):
 
     def __init__(self, max_verts=256, precision_error=0.0005,
                  schedule="geometric", ratio=2.0,
-                 conn="gts_v3", sort="morton", pack_meta=True,
-                 target_base=32, verbose=False):
+                 conn="gts_v3", sort="greedy_nn", pack_meta=True,
+                 target_base=32, dct_block_size=4,
+                 dct_schedule="uniform", dct_ratio=2.0, verbose=False):
         super().__init__(max_verts=max_verts, precision_error=precision_error,
                          wavelet="cdf53", schedule=schedule, ratio=ratio,
                          conn=conn, sort=sort, pack_meta=pack_meta,
-                         target_base=target_base, verbose=verbose)
+                         target_base=target_base,
+                         dct_block_size=dct_block_size,
+                         dct_schedule=dct_schedule, dct_ratio=dct_ratio,
+                         verbose=verbose)
 
 
 # ============================================================
