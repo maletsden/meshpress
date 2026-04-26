@@ -781,6 +781,975 @@ class MeshletWaveletGlobalAMD(Encoder):
 
 
 # ============================================================
+# Boundary / interior split (scaffold for float & neural wavelets)
+# Layout: global boundary table + per-meshlet [boundary refs | interior codes].
+# Interior here uses per-meshlet integer codes (lossless vs. global grid),
+# providing a baseline that pluggable float/neural transforms replace later.
+# See utils/boundary_split.py for the layout spec.
+# ============================================================
+
+class MeshletSplitAMD(Encoder):
+    """Boundary/interior split with AMD packed connectivity (crack-free).
+
+    Boundary verts live in a single global table (bitwise identical across
+    meshlets). Interior verts are per-meshlet, stored as lossless integer
+    deltas from a meshlet-local origin on the global grid. This is the
+    scaffold that later variants swap out for float/learned wavelet encoders
+    on the interior stream only.
+    """
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 conn="gts_v3", sort="morton", verbose=False):
+        self.max_verts = max_verts
+        self.precision_error = precision_error
+        self.conn = conn  # 'packed' or 'gts'
+        self.sort = sort  # 'eb' or 'morton'
+        self.verbose = verbose
+
+    def encode(self, model: Model) -> CompressedModel:
+        from utils.boundary_split import (
+            identify_boundary_verts, build_boundary_table,
+            split_meshlet_verts, boundary_table_bits, ref_bits_for,
+            quantize_interior_local, verify_crack_free,
+            sort_by_morton, gts_encode_meshlet,
+        )
+
+        verts_np, tris_np = _to_numpy(model)
+        n_v, n_t = len(verts_np), len(tris_np)
+        center = verts_np.mean(axis=0)
+        vc = verts_np - center
+        scale = np.max(np.linalg.norm(vc, axis=1))
+        vn = vc / scale
+        per_coord_err = self.precision_error / scale / np.sqrt(3)
+
+        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+
+        tri_adj = build_adjacency(tris_np)
+        fn = compute_face_normals(vn, tris_np)
+        fc = compute_face_centroids(vn, tris_np)
+        meshlets = generate_meshlets_by_verts(
+            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+
+        boundary_set = identify_boundary_verts(meshlets, tris_np)
+        boundary_list, gv_to_ref, _boundary_codes = build_boundary_table(
+            boundary_set, global_codes)
+        n_boundary = len(boundary_list)
+        ref_bits = ref_bits_for(n_boundary)
+
+        # Global header: g_min(12) + g_range(12) + g_bits(3) + n_meshlets(4)
+        #                + n_boundary(4) + ref_bits(1) = 36B
+        global_header_bits = 36 * 8
+        bnd_table_bits = boundary_table_bits(n_boundary, g_bits)
+
+        total_bits = global_header_bits + bnd_table_bits
+        total_bnd_refs = 0
+        total_interior = 0
+        total_conn = 0
+        total_ml_hdr = 0
+
+        for ml_tris in meshlets:
+            vert_order, _, _ = edgebreaker_vertex_order(
+                ml_tris, tris_np, tri_adj)
+            n_mv = len(vert_order)
+            if n_mv < 1:
+                continue
+
+            local_to_global, bnd_local, int_local, _remap = split_meshlet_verts(
+                vert_order, boundary_set)
+
+            # Boundary always Morton-sorted; interior dispatches on self.sort.
+            # Accepts "morton" | "eb" | "hilbert" | "pca" | "greedy_nn".
+            if self.sort != "eb":
+                from utils.interior_sorts import sort_interior as _si
+                bnd_local = sort_by_morton(bnd_local, global_codes)
+                int_local = _si(
+                    self.sort, int_local,
+                    global_codes=global_codes,
+                    vert_pos_float=vn,
+                )
+                local_to_global = bnd_local + int_local
+
+            n_bnd = len(bnd_local)
+            n_int = len(int_local)
+
+            # Per-meshlet header:
+            #   n_bnd(1) + n_int(1) + interior_offset(12) + interior_bits(3) = 17B
+            ml_hdr_bits = 17 * 8
+            total_ml_hdr += ml_hdr_bits
+
+            # Boundary refs
+            ref_total = n_bnd * ref_bits
+            total_bnd_refs += ref_total
+
+            # Interior codes (lossless integer deltas on the global grid)
+            int_codes_global = global_codes[int_local] if n_int > 0 else \
+                np.zeros((0, 3), dtype=np.int64)
+            _off, _lb, _codes, interior_bits = quantize_interior_local(
+                int_codes_global)
+            total_interior += interior_bits
+
+            if self.conn in ("gts", "gts_v2", "gts_v3"):
+                variant = {"gts": "v1", "gts_v2": "v2", "gts_v3": "v3"}[self.conn]
+                conn_bits, _ = gts_encode_meshlet(
+                    ml_tris, tris_np, tri_adj, local_to_global, variant=variant)
+            else:
+                conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
+            total_conn += conn_bits
+
+            total_bits += ml_hdr_bits + ref_total + interior_bits + conn_bits
+
+        # Crack verification on the integer codes (boundary dedup check)
+        n_cracks, n_shared = verify_crack_free(
+            meshlets, tris_np, global_codes, boundary_set)
+
+        # Full-mesh error (interior is lossless vs global codes, so
+        # reconstruction error equals global quantization error for all verts)
+        all_recon = _dequantize_global(global_codes, g_min, g_range, g_bits)
+        errors = np.linalg.norm(all_recon - vn, axis=1) * scale
+
+        bpv = total_bits / n_v
+        bpt = total_bits / n_t
+
+        if self.verbose:
+            pct = (errors <= self.precision_error).sum() / n_v * 100
+            bnd_frac = n_boundary / n_v * 100 if n_v else 0.0
+            print(f"MeshletSplitAMD (boundary/interior, crack-free) "
+                  f"mv={self.max_verts}  conn={self.conn}  sort={self.sort}:")
+            print(f"  {len(meshlets)} meshlets, {n_boundary} boundary verts "
+                  f"({bnd_frac:.1f}% of total)")
+            print(f"  Global bits=[{g_bits[0]},{g_bits[1]},{g_bits[2]}], "
+                  f"ref_bits={ref_bits}")
+            print(f"  Cracks: {n_cracks} / {n_shared} shared checks")
+            print(f"  Boundary table: {bnd_table_bits/8:,.0f}B")
+            print(f"  Boundary refs: {total_bnd_refs/8:,.0f}B")
+            print(f"  Interior codes: {total_interior/8:,.0f}B")
+            print(f"  Meshlet hdrs: {total_ml_hdr/8:,.0f}B  "
+                  f"Conn: {total_conn/8:,.0f}B")
+            print(f"  Total: {total_bits/8:,.0f}B  "
+                  f"BPV={bpv:.2f}  BPT={bpt:.2f}")
+            print(f"  Accuracy: max={errors.max():.6f}  %OK={pct:.1f}%")
+
+        return CompressedModel(bytes(int(np.ceil(total_bits / 8))), bpv, bpt)
+
+
+# ============================================================
+# Boundary/interior split with float Haar wavelet on interior.
+# Boundary stays on the global int grid (crack-free); interior is lossy float
+# Haar with uniform coefficient quantization tuned to per_coord_err.
+# ============================================================
+
+class MeshletSplitFloatWaveletAMD(Encoder):
+    """Boundary/interior split + float wavelet on interior vertices.
+
+    Boundary verts: global int grid (bitwise identical across meshlets).
+    Interior verts: original floats transformed by lifting wavelet
+    ('haar' or 'cdf53'), per-level uniformly quantized with a schedule
+    ('uniform' or 'geometric') tuned so reconstruction error stays within
+    per_coord_err.
+    """
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 wavelet="haar", schedule="geometric", ratio=2.0,
+                 conn="gts_v3", sort="morton", pack_meta=True,
+                 target_base=32, verbose=False):
+        self.max_verts = max_verts
+        self.precision_error = precision_error
+        self.wavelet = wavelet
+        self.schedule = schedule
+        self.ratio = ratio
+        self.conn = conn  # 'packed' | 'gts' | 'gts_v2'
+        self.sort = sort  # 'eb' | 'morton'
+        self.pack_meta = pack_meta  # True: 7B/level shared; False: 5B/stream
+        self.target_base = target_base
+        self.verbose = verbose
+
+    def encode(self, model: Model) -> CompressedModel:
+        from utils.boundary_split import (
+            identify_boundary_verts, build_boundary_table,
+            split_meshlet_verts, boundary_table_bits, ref_bits_for,
+            verify_crack_free, sort_by_morton, gts_encode_meshlet,
+        )
+        from utils.interior_sorts import sort_interior
+        from utils.float_wavelet import (
+            quantize_interior_float_wavelet,
+            quantize_interior_float_wavelet_packed,
+        )
+
+        verts_np, tris_np = _to_numpy(model)
+        n_v, n_t = len(verts_np), len(tris_np)
+        center = verts_np.mean(axis=0)
+        vc = verts_np - center
+        scale = np.max(np.linalg.norm(vc, axis=1))
+        vn = vc / scale
+        per_coord_err = self.precision_error / scale / np.sqrt(3)
+
+        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+
+        tri_adj = build_adjacency(tris_np)
+        fn = compute_face_normals(vn, tris_np)
+        fc = compute_face_centroids(vn, tris_np)
+        meshlets = generate_meshlets_by_verts(
+            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+
+        boundary_set = identify_boundary_verts(meshlets, tris_np)
+        boundary_list, gv_to_ref, _bnd_codes = build_boundary_table(
+            boundary_set, global_codes)
+        n_boundary = len(boundary_list)
+        ref_bits = ref_bits_for(n_boundary)
+
+        # Global header: g_min(12) + g_range(12) + g_bits(3) + n_meshlets(4)
+        #                + n_boundary(4) + ref_bits(1) = 36B
+        global_header_bits = 36 * 8
+        bnd_table_bits = boundary_table_bits(n_boundary, g_bits)
+
+        total_bits = global_header_bits + bnd_table_bits
+        total_bnd_refs = 0
+        total_interior = 0
+        total_conn = 0
+        total_ml_hdr = 0
+
+        # Track actual interior reconstruction to measure real error
+        interior_errors = []
+        boundary_errors = []
+
+        # Dequantized boundary (used for boundary reconstruction error)
+        bnd_recon_global = _dequantize_global(
+            global_codes, g_min, g_range, g_bits)
+
+        for ml_tris in meshlets:
+            vert_order, _, _ = edgebreaker_vertex_order(
+                ml_tris, tris_np, tri_adj)
+            n_mv = len(vert_order)
+            if n_mv < 1:
+                continue
+
+            local_to_global, bnd_local, int_local, _remap = split_meshlet_verts(
+                vert_order, boundary_set)
+
+            # Boundary always Morton-sorted (existing behavior).
+            # Interior dispatches on self.sort, which now accepts:
+            #   "morton" | "eb" | "hilbert" | "pca" | "greedy_nn".
+            if self.sort != "eb":
+                bnd_local = sort_by_morton(bnd_local, global_codes)
+                int_local = sort_interior(
+                    self.sort, int_local,
+                    global_codes=global_codes,
+                    vert_pos_float=vn,
+                )
+                local_to_global = bnd_local + int_local
+
+            n_bnd = len(bnd_local)
+            n_int = len(int_local)
+
+            # Per-meshlet header: n_bnd(1) + n_int(1) + reserved(2) = 4B.
+            # Interior float wavelet carries its own per-axis offset + q_step.
+            ml_hdr_bits = 4 * 8
+            total_ml_hdr += ml_hdr_bits
+
+            ref_total = n_bnd * ref_bits
+            total_bnd_refs += ref_total
+
+            # Interior float wavelet
+            if n_int > 0:
+                int_pts = vn[int_local]
+                quant_fn = (quantize_interior_float_wavelet_packed
+                            if self.pack_meta
+                            else quantize_interior_float_wavelet)
+                int_recon, int_bits, _meta = quant_fn(
+                    int_pts, per_coord_err,
+                    wavelet=self.wavelet,
+                    schedule=self.schedule,
+                    ratio=self.ratio,
+                    target_base=self.target_base,
+                )
+                total_interior += int_bits
+                # Measure real error in ORIGINAL (unnormalized) units
+                err = np.linalg.norm(int_recon - int_pts, axis=1) * scale
+                interior_errors.extend(err.tolist())
+
+            # Boundary error (from global int grid dequantization)
+            if n_bnd > 0:
+                for gv in bnd_local:
+                    err = np.linalg.norm(bnd_recon_global[gv] - vn[gv]) * scale
+                    boundary_errors.append(err)
+
+            if self.conn in ("gts", "gts_v2", "gts_v3"):
+                variant = {"gts": "v1", "gts_v2": "v2", "gts_v3": "v3"}[self.conn]
+                conn_bits, _ = gts_encode_meshlet(
+                    ml_tris, tris_np, tri_adj, local_to_global, variant=variant)
+            else:
+                conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
+            total_conn += conn_bits
+
+            total_bits += ml_hdr_bits + ref_total + \
+                (int_bits if n_int > 0 else 0) + conn_bits
+
+        # Crack verification (boundary is still on the global int grid)
+        n_cracks, n_shared = verify_crack_free(
+            meshlets, tris_np, global_codes, boundary_set)
+
+        bpv = total_bits / n_v
+        bpt = total_bits / n_t
+
+        if self.verbose:
+            import numpy as _np
+            bnd_err = _np.array(boundary_errors) if boundary_errors else _np.zeros(1)
+            int_err = _np.array(interior_errors) if interior_errors else _np.zeros(1)
+            combined = _np.concatenate([bnd_err, int_err])
+            pct = (combined <= self.precision_error).sum() / len(combined) * 100
+            bnd_frac = n_boundary / n_v * 100 if n_v else 0.0
+            print(f"MeshletSplitFloatWaveletAMD (crack-free) "
+                  f"mv={self.max_verts}  wavelet={self.wavelet}  "
+                  f"schedule={self.schedule}  ratio={self.ratio}  "
+                  f"conn={self.conn}  sort={self.sort}  "
+                  f"pack_meta={self.pack_meta}:")
+            print(f"  {len(meshlets)} meshlets, {n_boundary} boundary verts "
+                  f"({bnd_frac:.1f}% of total)")
+            print(f"  Global bits=[{g_bits[0]},{g_bits[1]},{g_bits[2]}], "
+                  f"ref_bits={ref_bits}")
+            print(f"  Cracks: {n_cracks} / {n_shared} shared checks")
+            print(f"  Boundary table: {bnd_table_bits/8:,.0f}B  "
+                  f"Boundary refs: {total_bnd_refs/8:,.0f}B")
+            print(f"  Interior float {self.wavelet}: {total_interior/8:,.0f}B")
+            print(f"  Meshlet hdrs: {total_ml_hdr/8:,.0f}B  "
+                  f"Conn: {total_conn/8:,.0f}B")
+            print(f"  Total: {total_bits/8:,.0f}B  "
+                  f"BPV={bpv:.2f}  BPT={bpt:.2f}")
+            print(f"  Boundary err: max={bnd_err.max():.6f}  "
+                  f"Interior err: max={int_err.max():.6f}")
+            print(f"  Combined %OK (<= {self.precision_error}): {pct:.1f}%")
+
+        return CompressedModel(bytes(int(np.ceil(total_bits / 8))), bpv, bpt)
+
+
+class MeshletSplitFloatHaarAMD(MeshletSplitFloatWaveletAMD):
+    """Split + float Haar interior (geometric per-level quantization)."""
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 schedule="geometric", ratio=2.0,
+                 conn="gts_v3", sort="morton", pack_meta=True,
+                 target_base=32, verbose=False):
+        super().__init__(max_verts=max_verts, precision_error=precision_error,
+                         wavelet="haar", schedule=schedule, ratio=ratio,
+                         conn=conn, sort=sort, pack_meta=pack_meta,
+                         target_base=target_base, verbose=verbose)
+
+
+class MeshletSplitDiffQuantAMD(Encoder):
+    """End-to-end differentiable interior encoder.
+
+    Two-pass per mesh:
+      1. Collect interior streams (one per meshlet × 3 axes).
+      2. Train a NeuralCompressor (MLP predictors + per-level learnable
+         μ-law curve α + learnable δ) with RD loss:
+             loss = λ_rate · Σ var(q_level)  +  λ_max · ReLU(‖x − x̂‖_∞ − ε)²
+         (variance proxy as the rate term, per user preference.)
+      3. Export MLP weights + α/δ; encode each meshlet with the learned
+         parameters via the numpy-side inference path (bit-exact at
+         inference since rounding is deterministic).
+    """
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 kernel_size=4, hidden=8,
+                 epochs=300, lr=5e-3,
+                 lambda_rate=1.0, lambda_max=1e5, seed=0,
+                 predictor_type="mlp",
+                 conn="gts_v3", sort="morton",
+                 target_base=32, verbose=False):
+        self.max_verts = max_verts
+        self.precision_error = precision_error
+        self.kernel_size = kernel_size
+        self.hidden = hidden
+        self.epochs = epochs
+        self.lr = lr
+        self.lambda_rate = lambda_rate
+        self.lambda_max = lambda_max
+        self.seed = seed
+        self.predictor_type = predictor_type   # 'mlp' or 'dense'
+        self.conn = conn
+        self.sort = sort
+        self.target_base = target_base
+        self.verbose = verbose
+
+    def encode(self, model: Model) -> CompressedModel:
+        from utils.boundary_split import (
+            identify_boundary_verts, build_boundary_table,
+            split_meshlet_verts, boundary_table_bits, ref_bits_for,
+            verify_crack_free, sort_by_morton, gts_encode_meshlet,
+        )
+        from utils.neural_compressor import (
+            train_compressor, quantize_interior_diff,
+        )
+
+        verts_np, tris_np = _to_numpy(model)
+        n_v, n_t = len(verts_np), len(tris_np)
+        center = verts_np.mean(axis=0); vc = verts_np - center
+        scale = np.max(np.linalg.norm(vc, axis=1)); vn = vc / scale
+        per_coord_err = self.precision_error / scale / np.sqrt(3)
+
+        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+        tri_adj = build_adjacency(tris_np)
+        fn = compute_face_normals(vn, tris_np); fc = compute_face_centroids(vn, tris_np)
+        meshlets = generate_meshlets_by_verts(
+            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+
+        boundary_set = identify_boundary_verts(meshlets, tris_np)
+        boundary_list, _, _ = build_boundary_table(boundary_set, global_codes)
+        n_boundary = len(boundary_list)
+        ref_bits = ref_bits_for(n_boundary)
+
+        # -- Pass 1: collect meshlet data + training streams
+        meshlet_data = []
+        training_streams = []
+        for ml_tris in meshlets:
+            vert_order, _, _ = edgebreaker_vertex_order(ml_tris, tris_np, tri_adj)
+            if len(vert_order) < 1:
+                continue
+            ltg, bnd_local, int_local, _ = split_meshlet_verts(
+                vert_order, boundary_set)
+            if self.sort == "morton":
+                bnd_local = sort_by_morton(bnd_local, global_codes)
+                int_local = sort_by_morton(int_local, global_codes)
+                ltg = bnd_local + int_local
+            meshlet_data.append((ml_tris, ltg, bnd_local, int_local))
+            if len(int_local) > 0:
+                pts = vn[int_local]
+                for d in range(3):
+                    off = float(pts[:, d].min())
+                    training_streams.append(pts[:, d] - off)
+
+        # -- Pass 2: train neural compressor
+        n_levels_max = max(1, int(np.ceil(np.log2(
+            self.max_verts / self.target_base))))
+        if self.verbose:
+            print(f"MeshletSplitDiffQuantAMD: training on "
+                  f"{len(training_streams):,} streams (eps={per_coord_err:.4e})")
+        _model, params = train_compressor(
+            training_streams,
+            kernel_size=self.kernel_size, hidden=self.hidden,
+            n_levels_max=n_levels_max, target_base=self.target_base,
+            eps=per_coord_err, epochs=self.epochs, lr=self.lr,
+            lambda_rate=self.lambda_rate, lambda_max=self.lambda_max,
+            predictor_type=self.predictor_type,
+            max_signal_len=self.max_verts,
+            seed=self.seed, verbose=self.verbose,
+        )
+
+        # -- Header accounting (MLP or Dense)
+        mlp_bytes = 0
+        for pd in params["predictors"]:
+            if pd["type"] == "dense":
+                eW, eb = pd["enc"]
+                dW, db = pd["dec"]
+                mlp_bytes += (eW.size + eb.size + dW.size + db.size) * 4
+            else:
+                for W, b in pd["layers"]:
+                    mlp_bytes += W.size * 4 + b.size * 4
+        alpha_delta_bytes = (params["n_levels"] + 1) * 2 * 4
+        global_header_bits = 36 * 8
+        param_header_bits = (mlp_bytes + alpha_delta_bytes) * 8
+        bnd_table_bits = boundary_table_bits(n_boundary, g_bits)
+
+        total_bits = global_header_bits + param_header_bits + bnd_table_bits
+        total_bnd_refs = 0
+        total_interior = 0
+        total_conn = 0
+        total_ml_hdr = 0
+        interior_errors = []
+        boundary_errors = []
+        bnd_recon_global = _dequantize_global(
+            global_codes, g_min, g_range, g_bits)
+
+        # -- Pass 3: encode each meshlet with learned params
+        for ml_tris, local_to_global, bnd_local, int_local in meshlet_data:
+            n_bnd = len(bnd_local)
+            n_int = len(int_local)
+
+            ml_hdr_bits = 4 * 8
+            total_ml_hdr += ml_hdr_bits
+            ref_total = n_bnd * ref_bits
+            total_bnd_refs += ref_total
+
+            int_bits = 0
+            if n_int > 0:
+                int_pts = vn[int_local]
+                int_recon, int_bits, _meta = quantize_interior_diff(
+                    int_pts, params, verbose=False)
+                total_interior += int_bits
+                err = np.linalg.norm(int_recon - int_pts, axis=1) * scale
+                interior_errors.extend(err.tolist())
+
+            if n_bnd > 0:
+                for gv in bnd_local:
+                    err = np.linalg.norm(bnd_recon_global[gv] - vn[gv]) * scale
+                    boundary_errors.append(err)
+
+            if self.conn in ("gts", "gts_v2", "gts_v3"):
+                variant = {"gts": "v1", "gts_v2": "v2", "gts_v3": "v3"}[self.conn]
+                conn_bits, _ = gts_encode_meshlet(
+                    ml_tris, tris_np, tri_adj, local_to_global, variant=variant)
+            else:
+                conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
+            total_conn += conn_bits
+
+            total_bits += ml_hdr_bits + ref_total + int_bits + conn_bits
+
+        n_cracks, n_shared = verify_crack_free(
+            meshlets, tris_np, global_codes, boundary_set)
+
+        bpv = total_bits / n_v
+        bpt = total_bits / n_t
+
+        if self.verbose:
+            import numpy as _np
+            bnd_err = _np.array(boundary_errors) if boundary_errors else _np.zeros(1)
+            int_err = _np.array(interior_errors) if interior_errors else _np.zeros(1)
+            combined = _np.concatenate([bnd_err, int_err])
+            pct = (combined <= self.precision_error).sum() / len(combined) * 100
+            bnd_frac = n_boundary / n_v * 100 if n_v else 0.0
+            print(f"MeshletSplitDiffQuantAMD (crack-free) "
+                  f"mv={self.max_verts}  K={self.kernel_size}  H={self.hidden}  "
+                  f"conn={self.conn}  sort={self.sort}:")
+            print(f"  {len(meshlets)} meshlets, {n_boundary} boundary verts "
+                  f"({bnd_frac:.1f}% of total)")
+            print(f"  Learned α: {params['alphas']}")
+            print(f"  Learned δ: {params['deltas']}")
+            print(f"  Cracks: {n_cracks} / {n_shared} shared checks")
+            print(f"  Boundary table: {bnd_table_bits/8:,.0f}B  "
+                  f"Boundary refs: {total_bnd_refs/8:,.0f}B")
+            print(f"  MLP+curve params: {mlp_bytes+alpha_delta_bytes:,} B")
+            print(f"  Interior diff-quant: {total_interior/8:,.0f}B  "
+                  f"Conn: {total_conn/8:,.0f}B")
+            print(f"  Total: {total_bits/8:,.0f}B  "
+                  f"BPV={bpv:.2f}  BPT={bpt:.2f}")
+            print(f"  Boundary err max={bnd_err.max():.6f}  "
+                  f"Interior err max={int_err.max():.6f}")
+            print(f"  Combined %OK (<= {self.precision_error}): {pct:.1f}%")
+
+        return CompressedModel(bytes(int(np.ceil(total_bits / 8))), bpv, bpt)
+
+
+class MeshletSplitMLPAMD(Encoder):
+    """Boundary/interior split + non-linear MLP lifting predictor.
+
+    - One tiny MLP per wavelet level, shared across all meshlets and axes.
+    - MLPs are trained once per mesh by Adam on the predict-the-odd task.
+    - Crack-free by construction (boundary on global int grid).
+    - Max-error guarantee: inverse-lifting amplification bounded by
+      Lip(MLP) * sqrt(K); passed to the δ allocator so
+        δ_base + amp * Σ δ_k ≤ 2 * per_coord_err.
+    - Quantization curve learned: the per-level δ ratio is chosen by a
+      short grid search over candidates to minimise total interior bits
+      under the error constraint.
+    """
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 kernel_size=4, hidden=16,
+                 ratio_candidates=(2.0, 4.0, 6.0, 8.0, 12.0, 16.0),
+                 epochs=300, lr=1e-3, weight_decay=1e-4, seed=0,
+                 conn="gts_v3", sort="morton",
+                 target_base=32, verbose=False):
+        self.max_verts = max_verts
+        self.precision_error = precision_error
+        self.kernel_size = kernel_size
+        self.hidden = hidden
+        self.ratio_candidates = tuple(ratio_candidates)
+        self.epochs = epochs
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.seed = seed
+        self.conn = conn
+        self.sort = sort
+        self.target_base = target_base
+        self.verbose = verbose
+
+    def encode(self, model: Model) -> CompressedModel:
+        from utils.boundary_split import (
+            identify_boundary_verts, build_boundary_table,
+            split_meshlet_verts, boundary_table_bits, ref_bits_for,
+            verify_crack_free, sort_by_morton, gts_encode_meshlet,
+        )
+        from utils.learned_mlp_wavelet import (
+            fit_mlps, mlp_lipschitz_bound, quantize_interior_mlp_wavelet,
+        )
+
+        verts_np, tris_np = _to_numpy(model)
+        n_v, n_t = len(verts_np), len(tris_np)
+        center = verts_np.mean(axis=0)
+        vc = verts_np - center
+        scale = np.max(np.linalg.norm(vc, axis=1))
+        vn = vc / scale
+        per_coord_err = self.precision_error / scale / np.sqrt(3)
+
+        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+
+        tri_adj = build_adjacency(tris_np)
+        fn = compute_face_normals(vn, tris_np)
+        fc = compute_face_centroids(vn, tris_np)
+        meshlets = generate_meshlets_by_verts(
+            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+
+        boundary_set = identify_boundary_verts(meshlets, tris_np)
+        boundary_list, _gv_to_ref, _bnd_codes = build_boundary_table(
+            boundary_set, global_codes)
+        n_boundary = len(boundary_list)
+        ref_bits = ref_bits_for(n_boundary)
+
+        # -- Pass 1: gather per-meshlet data + training streams
+        meshlet_data = []
+        training_streams = []
+        for ml_tris in meshlets:
+            vert_order, _, _ = edgebreaker_vertex_order(ml_tris, tris_np, tri_adj)
+            if len(vert_order) < 1:
+                continue
+            ltg, bnd_local, int_local, _ = split_meshlet_verts(
+                vert_order, boundary_set)
+            if self.sort == "morton":
+                bnd_local = sort_by_morton(bnd_local, global_codes)
+                int_local = sort_by_morton(int_local, global_codes)
+                ltg = bnd_local + int_local
+            meshlet_data.append((ml_tris, ltg, bnd_local, int_local))
+            if len(int_local) > 0:
+                pts = vn[int_local]
+                for d in range(3):
+                    off = float(pts[:, d].min())
+                    training_streams.append(pts[:, d] - off)
+
+        # -- Pass 2: train MLPs
+        n_levels_max = max(1, int(np.ceil(np.log2(
+            self.max_verts / self.target_base))))
+        if self.verbose:
+            print(f"MeshletSplitMLPAMD: training {n_levels_max} MLPs on "
+                  f"{len(training_streams):,} streams...")
+        mlp_weights, _modules = fit_mlps(
+            training_streams, n_levels_max,
+            kernel_size=self.kernel_size, hidden=self.hidden,
+            target_base=self.target_base,
+            epochs=self.epochs, lr=self.lr,
+            weight_decay=self.weight_decay, seed=self.seed,
+            verbose=self.verbose,
+        )
+        # Error-safe amp = max over levels of min(L2*sqrt(K), Linf) bound.
+        lip_per_level = [mlp_lipschitz_bound(w, self.kernel_size)
+                         for w in mlp_weights]
+        amp = max(1.0, max(lip_per_level))
+
+        # -- Pass 3: ratio sweep (learned quantization curve)
+        # Score each candidate ratio by summed interior bits
+        meshlets_with_int = [(i, md) for i, md in enumerate(meshlet_data)
+                             if len(md[3]) > 0]
+        best_ratio = self.ratio_candidates[0]
+        best_bits = None
+        sweep_results = {}
+        for r in self.ratio_candidates:
+            total = 0
+            for _, (_, _, _, int_local) in meshlets_with_int:
+                pts = vn[int_local]
+                _, bits, _ = quantize_interior_mlp_wavelet(
+                    pts, per_coord_err, mlp_weights, self.kernel_size,
+                    amp=amp, schedule="geometric", ratio=r,
+                    target_base=self.target_base,
+                )
+                total += bits
+            sweep_results[r] = total
+            if best_bits is None or total < best_bits:
+                best_bits = total
+                best_ratio = r
+
+        # -- Header accounting
+        # Standard global header (36 B) + MLP weights + learned ratio (4 B)
+        mlp_bytes = 0
+        for w_list in mlp_weights:
+            for W, b in w_list:
+                mlp_bytes += W.size * 4 + b.size * 4  # float32
+        global_header_bits = 36 * 8
+        ratio_bits = 32  # float32 learned ratio
+        mlp_header_bits = mlp_bytes * 8
+        bnd_table_bits = boundary_table_bits(n_boundary, g_bits)
+
+        total_bits = (global_header_bits + ratio_bits
+                      + mlp_header_bits + bnd_table_bits)
+        total_bnd_refs = 0
+        total_interior = 0
+        total_conn = 0
+        total_ml_hdr = 0
+        interior_errors = []
+        boundary_errors = []
+        bnd_recon_global = _dequantize_global(
+            global_codes, g_min, g_range, g_bits)
+
+        # -- Pass 4: encode each meshlet with chosen ratio
+        for ml_tris, local_to_global, bnd_local, int_local in meshlet_data:
+            n_bnd = len(bnd_local)
+            n_int = len(int_local)
+
+            ml_hdr_bits = 4 * 8
+            total_ml_hdr += ml_hdr_bits
+
+            ref_total = n_bnd * ref_bits
+            total_bnd_refs += ref_total
+
+            int_bits = 0
+            if n_int > 0:
+                int_pts = vn[int_local]
+                int_recon, int_bits, _meta = quantize_interior_mlp_wavelet(
+                    int_pts, per_coord_err, mlp_weights, self.kernel_size,
+                    amp=amp, schedule="geometric", ratio=best_ratio,
+                    target_base=self.target_base,
+                )
+                total_interior += int_bits
+                err = np.linalg.norm(int_recon - int_pts, axis=1) * scale
+                interior_errors.extend(err.tolist())
+
+            if n_bnd > 0:
+                for gv in bnd_local:
+                    err = np.linalg.norm(bnd_recon_global[gv] - vn[gv]) * scale
+                    boundary_errors.append(err)
+
+            if self.conn in ("gts", "gts_v2", "gts_v3"):
+                variant = {"gts": "v1", "gts_v2": "v2", "gts_v3": "v3"}[self.conn]
+                conn_bits, _ = gts_encode_meshlet(
+                    ml_tris, tris_np, tri_adj, local_to_global, variant=variant)
+            else:
+                conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
+            total_conn += conn_bits
+
+            total_bits += ml_hdr_bits + ref_total + int_bits + conn_bits
+
+        n_cracks, n_shared = verify_crack_free(
+            meshlets, tris_np, global_codes, boundary_set)
+
+        bpv = total_bits / n_v
+        bpt = total_bits / n_t
+
+        if self.verbose:
+            import numpy as _np
+            bnd_err = _np.array(boundary_errors) if boundary_errors else _np.zeros(1)
+            int_err = _np.array(interior_errors) if interior_errors else _np.zeros(1)
+            combined = _np.concatenate([bnd_err, int_err])
+            pct = (combined <= self.precision_error).sum() / len(combined) * 100
+            bnd_frac = n_boundary / n_v * 100 if n_v else 0.0
+            print(f"MeshletSplitMLPAMD (crack-free) "
+                  f"mv={self.max_verts}  K={self.kernel_size}  "
+                  f"H={self.hidden}  conn={self.conn}  sort={self.sort}:")
+            print(f"  {len(meshlets)} meshlets, {n_boundary} boundary verts "
+                  f"({bnd_frac:.1f}% of total)")
+            lip_str = ", ".join(f"{l:.2f}" for l in lip_per_level)
+            print(f"  MLP L_inf Lipschitz per level: [{lip_str}]  "
+                  f"amp={amp:.3f}")
+            print(f"  Ratio sweep (interior bytes):")
+            for r in self.ratio_candidates:
+                marker = " <--" if r == best_ratio else ""
+                print(f"    ratio={r:>5.1f}: {sweep_results[r]/8:9,.0f} B{marker}")
+            print(f"  Cracks: {n_cracks} / {n_shared} shared checks")
+            print(f"  Boundary table: {bnd_table_bits/8:,.0f}B  "
+                  f"Boundary refs: {total_bnd_refs/8:,.0f}B")
+            print(f"  MLP storage: {mlp_bytes:,} B  "
+                  f"(K={self.kernel_size}, H={self.hidden}, "
+                  f"L={n_levels_max})")
+            print(f"  Interior MLP: {total_interior/8:,.0f}B  "
+                  f"Conn: {total_conn/8:,.0f}B")
+            print(f"  Total: {total_bits/8:,.0f}B  "
+                  f"BPV={bpv:.2f}  BPT={bpt:.2f}")
+            print(f"  Boundary err: max={bnd_err.max():.6f}  "
+                  f"Interior err: max={int_err.max():.6f}")
+            print(f"  Combined %OK (<= {self.precision_error}): {pct:.1f}%")
+
+        return CompressedModel(bytes(int(np.ceil(total_bits / 8))), bpv, bpt)
+
+
+class MeshletSplitLearnedAMD(Encoder):
+    """Boundary/interior split + learned-lifting interior wavelet.
+
+    Two-pass encoder:
+      1. Collect all interior (per-axis) streams across meshlets.
+      2. Fit per-level linear predictor kernels by ridge-regularised lstsq.
+      3. Encode using the fitted kernels; store them once in the global header.
+
+    Kernels are shared across all meshlets and all axes (one kernel per
+    decomposition level). Storage overhead is negligible — e.g. 3 levels of
+    K=4 weights at float32 = 48 B.
+    """
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 schedule="geometric", ratio=2.0, kernel_size=4,
+                 conn="gts_v3", sort="morton", pack_meta=True,
+                 target_base=32, verbose=False):
+        self.max_verts = max_verts
+        self.precision_error = precision_error
+        self.schedule = schedule
+        self.ratio = ratio
+        self.kernel_size = kernel_size
+        self.conn = conn
+        self.sort = sort
+        self.pack_meta = pack_meta  # kept for API symmetry; layout is always packed
+        self.target_base = target_base
+        self.verbose = verbose
+
+    def encode(self, model: Model) -> CompressedModel:
+        from utils.boundary_split import (
+            identify_boundary_verts, build_boundary_table,
+            split_meshlet_verts, boundary_table_bits, ref_bits_for,
+            verify_crack_free, sort_by_morton, gts_encode_meshlet,
+        )
+        from utils.learned_wavelet import (
+            fit_kernels, quantize_interior_learned_wavelet,
+        )
+
+        verts_np, tris_np = _to_numpy(model)
+        n_v, n_t = len(verts_np), len(tris_np)
+        center = verts_np.mean(axis=0)
+        vc = verts_np - center
+        scale = np.max(np.linalg.norm(vc, axis=1))
+        vn = vc / scale
+        per_coord_err = self.precision_error / scale / np.sqrt(3)
+
+        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+
+        tri_adj = build_adjacency(tris_np)
+        fn = compute_face_normals(vn, tris_np)
+        fc = compute_face_centroids(vn, tris_np)
+        meshlets = generate_meshlets_by_verts(
+            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+
+        boundary_set = identify_boundary_verts(meshlets, tris_np)
+        boundary_list, _gv_to_ref, _bnd_codes = build_boundary_table(
+            boundary_set, global_codes)
+        n_boundary = len(boundary_list)
+        ref_bits = ref_bits_for(n_boundary)
+
+        # -- Pass 1: collect meshlet metadata + interior streams for training
+        meshlet_data = []  # per meshlet: (ml_tris, local_to_global, int_local, n_bnd)
+        training_streams = []
+        for ml_tris in meshlets:
+            vert_order, _, _ = edgebreaker_vertex_order(ml_tris, tris_np, tri_adj)
+            if len(vert_order) < 1:
+                continue
+            ltg, bnd_local, int_local, _ = split_meshlet_verts(
+                vert_order, boundary_set)
+            if self.sort == "morton":
+                bnd_local = sort_by_morton(bnd_local, global_codes)
+                int_local = sort_by_morton(int_local, global_codes)
+                ltg = bnd_local + int_local
+            meshlet_data.append((ml_tris, ltg, bnd_local, int_local))
+            if len(int_local) > 0:
+                pts = vn[int_local]
+                for d in range(3):
+                    off = float(pts[:, d].min())
+                    training_streams.append(pts[:, d] - off)
+
+        # -- Pass 2: fit kernels
+        n_levels_max = max(1, int(np.ceil(np.log2(self.max_verts / self.target_base))))
+        kernels = fit_kernels(training_streams, n_levels_max,
+                              self.kernel_size, self.target_base)
+        # Conservative amp = max kernel L1 norm (floor at 1.0)
+        amp = max(1.0, *(float(np.abs(k).sum()) for k in kernels))
+
+        # -- Global header: standard 36 B + kernels
+        global_header_bits = 36 * 8
+        kernel_storage_bits = n_levels_max * self.kernel_size * 32  # float32 weights
+        bnd_table_bits = boundary_table_bits(n_boundary, g_bits)
+
+        total_bits = global_header_bits + kernel_storage_bits + bnd_table_bits
+        total_bnd_refs = 0
+        total_interior = 0
+        total_conn = 0
+        total_ml_hdr = 0
+        interior_errors = []
+        boundary_errors = []
+        bnd_recon_global = _dequantize_global(global_codes, g_min, g_range, g_bits)
+
+        # -- Pass 3: encode each meshlet using fitted kernels
+        for ml_tris, local_to_global, bnd_local, int_local in meshlet_data:
+            n_bnd = len(bnd_local)
+            n_int = len(int_local)
+
+            ml_hdr_bits = 4 * 8
+            total_ml_hdr += ml_hdr_bits
+
+            ref_total = n_bnd * ref_bits
+            total_bnd_refs += ref_total
+
+            int_bits = 0
+            if n_int > 0:
+                int_pts = vn[int_local]
+                int_recon, int_bits, _meta = quantize_interior_learned_wavelet(
+                    int_pts, per_coord_err, kernels,
+                    schedule=self.schedule, ratio=self.ratio,
+                    target_base=self.target_base, amp=amp,
+                )
+                total_interior += int_bits
+                err = np.linalg.norm(int_recon - int_pts, axis=1) * scale
+                interior_errors.extend(err.tolist())
+
+            if n_bnd > 0:
+                for gv in bnd_local:
+                    err = np.linalg.norm(bnd_recon_global[gv] - vn[gv]) * scale
+                    boundary_errors.append(err)
+
+            if self.conn in ("gts", "gts_v2", "gts_v3"):
+                variant = {"gts": "v1", "gts_v2": "v2", "gts_v3": "v3"}[self.conn]
+                conn_bits, _ = gts_encode_meshlet(
+                    ml_tris, tris_np, tri_adj, local_to_global, variant=variant)
+            else:
+                conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
+            total_conn += conn_bits
+
+            total_bits += ml_hdr_bits + ref_total + int_bits + conn_bits
+
+        n_cracks, n_shared = verify_crack_free(
+            meshlets, tris_np, global_codes, boundary_set)
+
+        bpv = total_bits / n_v
+        bpt = total_bits / n_t
+
+        if self.verbose:
+            import numpy as _np
+            bnd_err = _np.array(boundary_errors) if boundary_errors else _np.zeros(1)
+            int_err = _np.array(interior_errors) if interior_errors else _np.zeros(1)
+            combined = _np.concatenate([bnd_err, int_err])
+            pct = (combined <= self.precision_error).sum() / len(combined) * 100
+            bnd_frac = n_boundary / n_v * 100 if n_v else 0.0
+            print(f"MeshletSplitLearnedAMD (crack-free) "
+                  f"mv={self.max_verts}  K={self.kernel_size}  "
+                  f"schedule={self.schedule}  ratio={self.ratio}  "
+                  f"conn={self.conn}  sort={self.sort}:")
+            print(f"  {len(meshlets)} meshlets, {n_boundary} boundary verts "
+                  f"({bnd_frac:.1f}% of total)")
+            print(f"  Fitted kernels (L1 norm, amp={amp:.3f}):")
+            for i, k in enumerate(kernels):
+                print(f"    level {i}: {np.array2string(k, precision=3)} "
+                      f"L1={np.abs(k).sum():.3f}")
+            print(f"  Cracks: {n_cracks} / {n_shared} shared checks")
+            print(f"  Boundary table: {bnd_table_bits/8:,.0f}B  "
+                  f"Boundary refs: {total_bnd_refs/8:,.0f}B  "
+                  f"Kernel storage: {kernel_storage_bits/8:,.0f}B")
+            print(f"  Interior learned: {total_interior/8:,.0f}B")
+            print(f"  Meshlet hdrs: {total_ml_hdr/8:,.0f}B  "
+                  f"Conn: {total_conn/8:,.0f}B")
+            print(f"  Total: {total_bits/8:,.0f}B  "
+                  f"BPV={bpv:.2f}  BPT={bpt:.2f}")
+            print(f"  Boundary err: max={bnd_err.max():.6f}  "
+                  f"Interior err: max={int_err.max():.6f}")
+            print(f"  Combined %OK (<= {self.precision_error}): {pct:.1f}%")
+
+        return CompressedModel(bytes(int(np.ceil(total_bits / 8))), bpv, bpt)
+
+
+class MeshletSplitFloatCDF53AMD(MeshletSplitFloatWaveletAMD):
+    """Split + float CDF 5/3 interior (geometric per-level quantization)."""
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 schedule="geometric", ratio=2.0,
+                 conn="gts_v3", sort="morton", pack_meta=True,
+                 target_base=32, verbose=False):
+        super().__init__(max_verts=max_verts, precision_error=precision_error,
+                         wavelet="cdf53", schedule=schedule, ratio=ratio,
+                         conn=conn, sort=sort, pack_meta=pack_meta,
+                         target_base=target_base, verbose=verbose)
+
+
+# ============================================================
 # Solution 2: Deduplicated boundary vertices
 # ============================================================
 
