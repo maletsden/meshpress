@@ -59,6 +59,61 @@ def _delta_schedule(block_size: int, eps: float, schedule: str, ratio: float):
     return delta_0 * weights
 
 
+def quantize_interior_dct2d_packed(positions, per_coord_err, block_size=4):
+    """2D DCT-II per (B, 3) block - decorrelates both along the sorted-index
+    axis (length B) AND across the 3 spatial axes (length 3) jointly.
+
+    Error bound: orthonormal 2D DCT-II preserves L2 norm in both directions,
+    so for uniform delta:
+        ||x_recon - x||_inf <= ||c_recon - c||_F <= (delta/2) * sqrt(B * 3)
+    Setting that <= eps gives delta = 2 * eps / sqrt(B * 3).
+
+    Packs per coefficient position (3 * B bit-widths per meshlet) so HF
+    positions can spend few bits when energy concentrates in low-freq cells.
+
+    Returns (recon, total_bits, meta).
+    """
+    positions = np.asarray(positions, dtype=np.float64)
+    n = len(positions)
+    if n == 0:
+        return positions.copy(), 0, {"block_size": block_size, "kind": "2d"}
+
+    B = block_size
+    delta = 2.0 * per_coord_err / np.sqrt(B * 3)
+    n_padded = ((n + B - 1) // B) * B
+    n_blocks = n_padded // B
+
+    padded = np.zeros((n_padded, 3), dtype=np.float64)
+    offsets = np.zeros(3, dtype=np.float64)
+    for d in range(3):
+        offsets[d] = float(positions[:, d].min())
+        padded[:n, d] = positions[:, d] - offsets[d]
+    blocks = padded.reshape(n_blocks, B, 3)
+    coefs = dct(dct(blocks, type=2, norm="ortho", axis=1),
+                type=2, norm="ortho", axis=2)
+    codes = np.round(coefs / delta).astype(np.int64)        # (n_blocks, B, 3)
+    coefs_recon = codes.astype(np.float64) * delta
+    rec = idct(idct(coefs_recon, type=2, norm="ortho", axis=2),
+               type=2, norm="ortho", axis=1)
+    rec_flat = rec.reshape(n_padded, 3)[:n] + offsets[None, :]
+
+    # Pack: 3 * float32 offsets + per-coefficient-position bit-widths.
+    # Per-position stream length = n_blocks. 3 * B = 12 streams (B=4).
+    total_bits = 3 * 32
+    for i in range(B):
+        for j in range(3):
+            stream = codes[:, i, j]
+            mn = int(stream.min())
+            rng = int(stream.max() - mn)
+            b = max(1, int(np.ceil(np.log2(rng + 2)))) if rng > 0 else 1
+            body = _stream_bits(stream - mn, b)
+            meta = 16 + 8  # int16 min + uint8 width
+            total_bits += body + meta
+
+    return rec_flat, total_bits, {"block_size": block_size, "kind": "2d",
+                                  "n_padded": n_padded}
+
+
 def quantize_interior_dct_packed(positions, per_coord_err, block_size=16,
                                  schedule="uniform", ratio=2.0):
     """Block-DCT-II interior encoder with packed per-axis metadata.
