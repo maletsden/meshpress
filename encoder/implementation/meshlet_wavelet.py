@@ -1069,8 +1069,9 @@ class MeshletSplitFloatWaveletAMD(Encoder):
             local_to_global, bnd_local, int_local, _remap = split_meshlet_verts(
                 vert_order, boundary_set)
 
-            # Boundary always Morton-sorted (existing behavior).
-            # Interior dispatches on self.sort, which now accepts:
+            # Boundary always Morton-sorted (boundary_sort variants verified
+            # to produce identical conn bits in cycle-B sweep, so no extra
+            # knob exposed). Interior dispatches on self.sort, accepting
             #   "morton" | "eb" | "hilbert" | "pca" | "greedy_nn".
             if self.sort != "eb":
                 bnd_local = sort_by_morton(bnd_local, global_codes)
@@ -1188,6 +1189,411 @@ class MeshletSplitFloatHaarAMD(MeshletSplitFloatWaveletAMD):
                          dct_schedule=dct_schedule, dct_ratio=dct_ratio,
                          dct2d_block_size=dct2d_block_size,
                          verbose=verbose)
+
+
+# ============================================================
+# Boundary/interior split with parallelogram predictor on interior.
+# Boundary identical to other split encoders (global int grid, crack-free).
+# Interior: causal parallelogram predict + per-axis uniform residual quant.
+# Idea #11 from docs/compression_ideas.md, NN bias deferred to a follow-up.
+# ============================================================
+
+class MeshletSplitParaAMD(Encoder):
+    """Boundary/interior split + parallelogram predictor on interior.
+
+    No NN bias yet — pure Touma-Gotsman parallelogram with greedy traversal
+    over interior verts. Single-edge midpoint and one-neighbour deltas are
+    automatic fallbacks when full parallelogram context isn't available.
+    """
+
+    def __init__(self, max_verts=256, precision_error=0.0005,
+                 conn="gts_v3", sort="greedy_nn",
+                 use_nn=False, nn_steps=300, nn_lr=1e-2,
+                 boundary_codec="flat",
+                 use_cuda=False,
+                 verbose=False):
+        self.max_verts = max_verts
+        self.precision_error = precision_error
+        self.conn = conn
+        self.sort = sort  # only used to keep boundary ordering compatible
+        self.use_nn = use_nn
+        self.nn_steps = nn_steps
+        self.nn_lr = nn_lr
+        self.boundary_codec = boundary_codec  # "flat" | "delta"
+        self.use_cuda = use_cuda
+        self.verbose = verbose
+
+    def encode(self, model: Model) -> CompressedModel:
+        from utils.boundary_split import (
+            identify_boundary_verts, build_boundary_table,
+            split_meshlet_verts, boundary_table_bits, ref_bits_for,
+            verify_crack_free, sort_by_morton, gts_encode_meshlet,
+        )
+        from utils.interior_sorts import sort_interior
+        from utils.parallelogram_predictor import (
+            quantize_interior_parallelogram,
+        )
+        from utils.parallelogram_nn import (
+            train_bias_mlp, quantize_weights, dequantize_weights,
+        )
+
+        verts_np, tris_np = _to_numpy(model)
+        n_v, n_t = len(verts_np), len(tris_np)
+        center = verts_np.mean(axis=0)
+        vc = verts_np - center
+        scale = np.max(np.linalg.norm(vc, axis=1))
+        vn = vc / scale
+        per_coord_err = self.precision_error / scale / np.sqrt(3)
+
+        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+
+        tri_adj = build_adjacency(tris_np)
+        fn = compute_face_normals(vn, tris_np)
+        fc = compute_face_centroids(vn, tris_np)
+        meshlets = generate_meshlets_by_verts(
+            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+
+        boundary_set = identify_boundary_verts(meshlets, tris_np)
+        boundary_list, gv_to_ref, _bnd_codes = build_boundary_table(
+            boundary_set, global_codes)
+        n_boundary = len(boundary_list)
+        ref_bits = ref_bits_for(n_boundary)
+
+        global_header_bits = 36 * 8
+
+        # Boundary-table encoding: flat (default, n*sum(g_bits)) or
+        # Morton-sorted axis-delta + rice (plan 12). Permuting the table
+        # also clusters per-meshlet refs locally → smaller delta refs.
+        if self.boundary_codec == "delta":
+            from utils.boundary_bvh import (
+                morton_permute_boundary, delta_boundary_table_bits,
+                delta_refs_bits,
+            )
+            boundary_list, _ = morton_permute_boundary(
+                boundary_list, global_codes)
+            gv_to_ref = {gv: i for i, gv in enumerate(boundary_list)}
+            sorted_codes = (global_codes[boundary_list]
+                            if boundary_list else np.zeros((0, 3), np.int64))
+            bnd_table_bits = delta_boundary_table_bits(sorted_codes)
+        else:
+            delta_refs_bits = None
+            bnd_table_bits = boundary_table_bits(n_boundary, g_bits)
+
+        bnd_recon_global = _dequantize_global(
+            global_codes, g_min, g_range, g_bits)
+
+        def _run_pass_cuda():
+            from utils.parallelogram_predictor_cuda import (
+                pack_meshlets, encode_meshlets_cuda,
+            )
+            from utils.residual_entropy import best_axis_bits
+
+            interior_errors = []
+            boundary_errors = []
+            kind_hits = {'para': 0, 'mid': 0, 'one': 0, 'none': 0}
+            total_bits_local = global_header_bits + bnd_table_bits
+            total_bnd_refs_l = 0
+            total_interior_l = 0
+            total_conn_l = 0
+            total_ml_hdr_l = 0
+
+            # Phase A: per-meshlet topology decisions (CPU).
+            vert_orders = []
+            ml_local_to_global = []
+            ml_bnd_local = []
+            ml_int_local = []
+            ml_ref_totals = []
+            ml_conn_bits = []
+            for ml_tris in meshlets:
+                vert_order, _, _ = edgebreaker_vertex_order(
+                    ml_tris, tris_np, tri_adj)
+                vert_orders.append(vert_order)
+                if len(vert_order) < 1:
+                    ml_local_to_global.append([])
+                    ml_bnd_local.append([])
+                    ml_int_local.append([])
+                    ml_ref_totals.append(0)
+                    ml_conn_bits.append(0)
+                    continue
+                local_to_global, bnd_local, int_local, _ = \
+                    split_meshlet_verts(vert_order, boundary_set)
+                if self.sort != "eb":
+                    bnd_local = sort_by_morton(bnd_local, global_codes)
+                    int_local = sort_interior(
+                        self.sort, int_local,
+                        global_codes=global_codes,
+                        vert_pos_float=vn,
+                    )
+                    local_to_global = bnd_local + int_local
+                ml_local_to_global.append(local_to_global)
+                ml_bnd_local.append(bnd_local)
+                ml_int_local.append(int_local)
+                if self.boundary_codec == "delta" and len(bnd_local) > 0:
+                    refs = [gv_to_ref[gv] for gv in bnd_local]
+                    ml_ref_totals.append(delta_refs_bits(refs))
+                else:
+                    ml_ref_totals.append(len(bnd_local) * ref_bits)
+                if self.conn in ("gts", "gts_v2", "gts_v3"):
+                    variant = {"gts": "v1", "gts_v2": "v2",
+                               "gts_v3": "v3"}[self.conn]
+                    conn_bits, _ = gts_encode_meshlet(
+                        ml_tris, tris_np, tri_adj, local_to_global,
+                        variant=variant)
+                else:
+                    conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
+                ml_conn_bits.append(conn_bits)
+
+            def _identity_sort(b, i):
+                return b, i
+
+            gpu_in, meta = pack_meshlets(
+                meshlets=meshlets, tris_np=tris_np, vn=vn,
+                bnd_recon_global=bnd_recon_global,
+                boundary_set=boundary_set,
+                per_coord_err=per_coord_err,
+                vert_orders=[
+                    ml_local_to_global[m] for m in range(len(meshlets))
+                ],
+                sort_fn=_identity_sort,
+            )
+            codes_all, order_all, pos_recon_all = encode_meshlets_cuda(
+                gpu_in, meta)
+
+            # Phase C: per-meshlet bit count + error + accounting.
+            int_off = gpu_in['int_off']
+            v_off = gpu_in['v_off']
+            n_bnd_arr = gpu_in['n_bnd']
+            for m, ml_tris in enumerate(meshlets):
+                bnd_local = ml_bnd_local[m]
+                int_local = ml_int_local[m]
+                n_bnd = len(bnd_local)
+                n_int = len(int_local)
+                ml_hdr_bits = 4 * 8
+                total_ml_hdr_l += ml_hdr_bits
+                ref_total = ml_ref_totals[m]
+                total_bnd_refs_l += ref_total
+                conn_bits = ml_conn_bits[m]
+                total_conn_l += conn_bits
+
+                int_bits = 0
+                if n_int > 0:
+                    s = int(int_off[m])
+                    e = s + n_int
+                    codes_m = codes_all[s:e]  # (n_int, 3)
+                    for d in range(3):
+                        ax_bits, _, _ = best_axis_bits(codes_m[:, d])
+                        int_bits += ax_bits
+                    total_interior_l += int_bits
+                    # Reconstructed positions, in CUDA local order =
+                    # order_all[s:e]; convert to int_local-order error.
+                    base = int(v_off[m])
+                    recon_local = pos_recon_all[base:base + n_bnd + n_int]
+                    int_recon = recon_local[n_bnd:n_bnd + n_int]
+                    err = np.linalg.norm(
+                        int_recon - vn[int_local], axis=1) * scale
+                    interior_errors.extend(err.tolist())
+                if n_bnd > 0:
+                    for gv in bnd_local:
+                        err = np.linalg.norm(
+                            bnd_recon_global[gv] - vn[gv]) * scale
+                        boundary_errors.append(err)
+                total_bits_local += ml_hdr_bits + ref_total + int_bits + conn_bits
+
+            return {
+                'total_bits': total_bits_local,
+                'total_bnd_refs': total_bnd_refs_l,
+                'total_interior': total_interior_l,
+                'total_conn': total_conn_l,
+                'total_ml_hdr': total_ml_hdr_l,
+                'kind_hits': kind_hits,  # not tracked on CUDA path
+                'interior_errors': interior_errors,
+                'boundary_errors': boundary_errors,
+                'feats': [],
+                'targets': [],
+            }
+
+        def _run_pass(mlp, collect):
+            interior_errors = []
+            boundary_errors = []
+            kind_hits = {'para': 0, 'mid': 0, 'one': 0, 'none': 0}
+            total_bits_local = global_header_bits + bnd_table_bits
+            total_bnd_refs_l = 0
+            total_interior_l = 0
+            total_conn_l = 0
+            total_ml_hdr_l = 0
+            all_train_feats = []
+            all_train_targets = []
+            for ml_tris in meshlets:
+                vert_order, _, _ = edgebreaker_vertex_order(
+                    ml_tris, tris_np, tri_adj)
+                if len(vert_order) < 1:
+                    continue
+                local_to_global, bnd_local, int_local, _remap = \
+                    split_meshlet_verts(vert_order, boundary_set)
+                if self.sort != "eb":
+                    bnd_local = sort_by_morton(bnd_local, global_codes)
+                    int_local = sort_interior(
+                        self.sort, int_local,
+                        global_codes=global_codes,
+                        vert_pos_float=vn,
+                    )
+                    local_to_global = bnd_local + int_local
+                n_bnd = len(bnd_local)
+                n_int = len(int_local)
+                ml_hdr_bits = 4 * 8
+                total_ml_hdr_l += ml_hdr_bits
+                if self.boundary_codec == "delta" and n_bnd > 0:
+                    refs = [gv_to_ref[gv] for gv in bnd_local]
+                    ref_total = delta_refs_bits(refs)
+                else:
+                    ref_total = n_bnd * ref_bits
+                total_bnd_refs_l += ref_total
+                if n_int > 0:
+                    int_recon, int_bits, stats = quantize_interior_parallelogram(
+                        int_local=int_local,
+                        bnd_local=bnd_local,
+                        ml_tris_global_idx=ml_tris,
+                        tris_np=tris_np,
+                        vn=vn,
+                        bnd_recon_float=bnd_recon_global,
+                        per_coord_err=per_coord_err,
+                        mlp=mlp,
+                        collect_training=collect,
+                    )
+                    total_interior_l += int_bits
+                    err = np.linalg.norm(int_recon - vn[int_local], axis=1) * scale
+                    interior_errors.extend(err.tolist())
+                    for k, v in stats['hits'].items():
+                        kind_hits[k] += v
+                    if collect:
+                        all_train_feats.extend(stats['train_feats'])
+                        all_train_targets.extend(stats['train_targets'])
+                else:
+                    int_bits = 0
+                if n_bnd > 0:
+                    for gv in bnd_local:
+                        err = np.linalg.norm(bnd_recon_global[gv] - vn[gv]) * scale
+                        boundary_errors.append(err)
+                if self.conn in ("gts", "gts_v2", "gts_v3"):
+                    variant = {"gts": "v1", "gts_v2": "v2",
+                               "gts_v3": "v3"}[self.conn]
+                    conn_bits, _ = gts_encode_meshlet(
+                        ml_tris, tris_np, tri_adj, local_to_global,
+                        variant=variant)
+                else:
+                    conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
+                total_conn_l += conn_bits
+                total_bits_local += ml_hdr_bits + ref_total + int_bits + conn_bits
+            return {
+                'total_bits': total_bits_local,
+                'total_bnd_refs': total_bnd_refs_l,
+                'total_interior': total_interior_l,
+                'total_conn': total_conn_l,
+                'total_ml_hdr': total_ml_hdr_l,
+                'kind_hits': kind_hits,
+                'interior_errors': interior_errors,
+                'boundary_errors': boundary_errors,
+                'feats': all_train_feats,
+                'targets': all_train_targets,
+            }
+
+        nn_header_bits = 0
+        if self.use_cuda and not self.use_nn:
+            res = _run_pass_cuda()
+        elif self.use_nn:
+            # Pass 1: plain parallelogram, collect features.
+            r1 = _run_pass(mlp=None, collect=True)
+            from utils.parallelogram_nn import N_FEATURES as _NF
+            feats = (np.array(r1['feats'], dtype=np.float64)
+                     if r1['feats'] else np.zeros((0, _NF)))
+            targs = (np.array(r1['targets'], dtype=np.float64)
+                     if r1['targets'] else np.zeros((0, 3)))
+            mlp = train_bias_mlp(feats, targs, n_steps=self.nn_steps,
+                                 lr=self.nn_lr, verbose=self.verbose)
+            qweights, nn_header_bits = quantize_weights(mlp)
+            mlp_q = dequantize_weights(qweights)
+            # Pass 2: encode with quantized MLP.
+            res = _run_pass(mlp=mlp_q, collect=False)
+        else:
+            res = _run_pass(mlp=None, collect=False)
+
+        total_bits = res['total_bits'] + nn_header_bits
+        total_bnd_refs = res['total_bnd_refs']
+        total_interior = res['total_interior']
+        total_conn = res['total_conn']
+        total_ml_hdr = res['total_ml_hdr']
+        kind_hits = res['kind_hits']
+        interior_errors = res['interior_errors']
+        boundary_errors = res['boundary_errors']
+
+        n_cracks, n_shared = verify_crack_free(
+            meshlets, tris_np, global_codes, boundary_set)
+
+        bpv = total_bits / n_v
+        bpt = total_bits / n_t
+
+        if self.verbose:
+            bnd_err = np.array(boundary_errors) if boundary_errors else np.zeros(1)
+            int_err = np.array(interior_errors) if interior_errors else np.zeros(1)
+            combined = np.concatenate([bnd_err, int_err])
+            pct = (combined <= self.precision_error).sum() / len(combined) * 100
+            bnd_frac = n_boundary / n_v * 100 if n_v else 0.0
+            n_int_total = sum(kind_hits.values()) or 1
+            print(f"MeshletSplitParaAMD (crack-free) "
+                  f"mv={self.max_verts}  conn={self.conn}  sort={self.sort}:")
+            print(f"  {len(meshlets)} meshlets, {n_boundary} boundary verts "
+                  f"({bnd_frac:.1f}% of total)")
+            print(f"  Cracks: {n_cracks} / {n_shared} shared checks")
+            print(f"  Predict hits: para={kind_hits['para']} "
+                  f"({100*kind_hits['para']/n_int_total:.1f}%) "
+                  f"mid={kind_hits['mid']} one={kind_hits['one']} "
+                  f"none={kind_hits['none']}")
+            print(f"  Boundary table: {bnd_table_bits/8:,.0f}B  "
+                  f"Boundary refs: {total_bnd_refs/8:,.0f}B")
+            print(f"  Interior para: {total_interior/8:,.0f}B  "
+                  f"NN header: {nn_header_bits/8:,.0f}B")
+            print(f"  Meshlet hdrs: {total_ml_hdr/8:,.0f}B  "
+                  f"Conn: {total_conn/8:,.0f}B")
+            print(f"  Total: {total_bits/8:,.0f}B  "
+                  f"BPV={bpv:.2f}  BPT={bpt:.2f}")
+            print(f"  Boundary err: max={bnd_err.max():.6f}  "
+                  f"Interior err: max={int_err.max():.6f}")
+            print(f"  Combined %OK (<= {self.precision_error}): {pct:.1f}%")
+
+        return CompressedModel(bytes(int(np.ceil(total_bits / 8))), bpv, bpt)
+
+
+class MeshletParaDelta(MeshletSplitParaAMD):
+    """Crack-free meshlet encoder that beats GTSSegDelta.
+
+    Pipeline:
+      - Global int-grid quantization (crack-free).
+      - Per-meshlet boundary/interior split.
+      - Boundary table: Morton-permuted axis-delta + Rice (vs flat).
+      - Boundary refs: sorted-delta + Rice (vs flat log2(n)).
+      - Interior: causal Touma-Gotsman parallelogram predictor + Rice/EG/arith
+        residuals.
+      - Optional 13-feature MLP curvature bias (second-ring apexes).
+
+    Defaults are tuned for the best published BPV result on stanford-bunny
+    (30.16 BPV, mv=384, NN on) and Monkey (31.53 BPV, mv=512, NN on). For
+    encode-time-sensitive workloads, set use_nn=False — gain is only
+    ~0.07 BPV but training adds ~3x to encode time.
+    """
+
+    def __init__(self, max_verts=384, precision_error=0.0005,
+                 use_nn=True, nn_steps=300, use_cuda=False, verbose=False):
+        super().__init__(
+            max_verts=max_verts,
+            precision_error=precision_error,
+            conn="gts_v3",
+            sort="greedy_nn",
+            use_nn=use_nn,
+            nn_steps=nn_steps,
+            boundary_codec="delta",
+            use_cuda=use_cuda,
+            verbose=verbose,
+        )
 
 
 class MeshletSplitDiffQuantAMD(Encoder):

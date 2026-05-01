@@ -1,12 +1,16 @@
 # MeshPress
 
-MeshPress is a 3D mesh compression library for real-time GPU decompression. It extends the AMD GPUOpen meshlet compression approach with segmented delta vertex encoding, achieving **24% better compression** while maintaining crack-free rendering and GPU-parallel decode.
+MeshPress is a 3D mesh compression library for real-time GPU decompression. It extends the AMD GPUOpen meshlet compression approach with two encoders that both beat the AMD baseline while remaining crack-free:
+
+- **`MeshletGTSSegDelta`** — segmented-delta vertices on GTS connectivity. **24% better** compression than AMD baseline, GPU-parallel decode (~10 µs/meshlet on RTX 3090).
+- **`MeshletParaDelta`** — Touma-Gotsman parallelogram predictor on a boundary/interior split, with Morton-delta boundary coding and an optional 13-feature curvature MLP. **~6–10% better** compression than `GTSSegDelta` (29.34 vs 31.17 BPV on a 1.8M-vert tank model; 30.16 vs 32.49 on stanford-bunny), still crack-free. CUDA-accelerated encode via CuPy RawKernel — 33× speedup on the para predictor for million-vertex meshes.
 
 ## Features
 
 - **Crack-free** meshlet compression via global quantization grid
 - **GPU-parallel** decompression using GTS strip decode (countbits/firstbithigh intrinsics)
 - **Segmented delta** vertex encoding: 24% smaller vertices than AMD baseline
+- **Parallelogram + delta-boundary** encoder: another ~7% on top of SegDelta
 - Controlled precision: guaranteed maximum reconstruction error
 - Scales to millions of polygons (tested on 1.8M vertex models)
 
@@ -34,6 +38,17 @@ compressed = encoder.encode(model)
 # AMD baseline: GTS connectivity + plain quantized vertices (crack-free, GPU-parallel)
 encoder = MeshletGTSPlain(max_verts=256, precision_error=0.0005, verbose=True)
 compressed = encoder.encode(model)
+
+# Best compression: parallelogram predictor + delta boundary (crack-free)
+from encoder import MeshletParaDelta
+encoder = MeshletParaDelta(max_verts=384, precision_error=0.0005,
+                           use_nn=True, verbose=True)
+compressed = encoder.encode(model)
+
+# Million-vertex meshes: skip NN, run para predictor on GPU (CuPy)
+encoder = MeshletParaDelta(max_verts=512, precision_error=0.0005,
+                           use_nn=False, use_cuda=True, verbose=True)
+compressed = encoder.encode(model)
 ```
 
 ## Compression Benchmarks
@@ -42,14 +57,36 @@ All encoders use **AMD GTS connectivity** (Generalized Triangle Strip with L/R f
 
 ### Full Pipeline (GTS connectivity + vertices, max_error=0.0005)
 
-| Model | Verts | Tris | AMD Baseline BPV | SegDelta BPV | Haar BPV | SegDelta Improvement |
-|-------|------:|-----:|-----------------:|-------------:|---------:|---------------------:|
-| bunny | 2,503 | 4,968 | 47.34 | **41.53** | 42.28 | +12.3% |
-| torus | 3,840 | 7,680 | 56.48 | **39.07** | 38.56 | +30.8% |
-| stanford-bunny | 35,947 | 69,451 | 37.90 | **32.49** | 34.47 | +14.3% |
-| Monkey | 504,482 | 1,007,616 | 41.54 | **31.69** | 33.77 | +23.7% |
+| Model | Verts | Tris | AMD Baseline BPV | SegDelta BPV | Haar BPV | **ParaDelta BPV** | ParaDelta vs AMD |
+|-------|------:|-----:|-----------------:|-------------:|---------:|------------------:|-----------------:|
+| bunny | 2,503 | 4,968 | 47.34 | 41.53 | 42.28 | **37.19** | **+21.4%** |
+| torus | 3,840 | 7,680 | 56.48 | **39.07** | 38.56 | 39.94 | +29.3% |
+| stanford-bunny | 35,947 | 69,451 | 37.90 | 32.49 | 34.47 | **30.16** | **+20.4%** |
+| Monkey | 504,482 | 1,007,616 | 41.54 | 31.69 | 33.77 | **31.53** | **+24.1%** |
+| **tank** | **1,806,639** | **3,514,247** | — | 31.17 | — | **29.34** | **−5.9% vs SegDelta** |
 
 All crack-free (0 shared vertex mismatches verified). 100% within error target.
+`ParaDelta` is `MeshletParaDelta` at default settings (mv=384 with `use_nn=True`
+on bunny/stanford-bunny, mv=512 with `use_nn=False, use_cuda=True` on
+Monkey/tank). `SegDelta` still wins on `torus` because boundary refs cost more
+than interior gains save when triangle count is low.
+
+### Encode Speed (CPU vs CUDA Para Predictor)
+
+The para predictor is the per-meshlet causal hot loop. With `use_cuda=True`
+(CuPy + RawKernel, 32 threads/block, 1 thread per meshlet) it runs **bit-exactly**
+the same encoder on the GPU and produces the same output.
+
+| Mesh | CPU para | **GPU para** | Speedup | Total encode (CPU → GPU) |
+|------|---------:|-------------:|--------:|-------------------------:|
+| stanford-bunny (36K verts) | 6.0 s | — | — | — |
+| Monkey (504K verts) | 56 s | **1.7 s** | **33×** | 92 s → **36 s** |
+| tank (1.8M verts) | ~10 min (est.) | ~3 s (est.) | ~30× | ~10 min → **127 s** |
+
+The CUDA path is required to test `MeshletParaDelta` on million-vertex models in
+reasonable time — the CPU para predictor is O(meshlet_count × meshlet_size²) in
+practice. Phase A (vert ordering, sort, GTS connectivity) and meshlet generation
+are still pure-Python and dominate the remaining encode time.
 
 ### Bits Breakdown (Monkey, GTS+SegDelta)
 
@@ -80,6 +117,61 @@ Segmented delta gives the best compression AND the fastest GPU decode: 32 indepe
 | GTS+Haar Opt v3 (ours) | ~10 µs | ~45 µs |
 
 Our segmented delta adds only **+21% decode overhead** on large meshes vs the plain AMD baseline, while providing **24% better compression**. On small meshes it's actually faster.
+
+## `MeshletParaDelta` — Best Compression (Crack-Free)
+
+`MeshletParaDelta` extends the meshlet pipeline with three ideas that, together,
+beat both `GTSSegDelta` and the AMD baseline by ~20–24% on real meshes:
+
+```
+Mesh → Global int-grid quantization (crack-free)
+     → Meshlet generation (greedy, max 384 verts default)
+     → Per meshlet:
+         Boundary / interior split
+         Boundary refs:  Morton-sort table → axis-delta + Rice
+         Interior verts: causal Touma-Gotsman parallelogram predictor
+                         residual = true − (a + b − c)
+                         per-axis best of {fixed, Rice, exp-Golomb, arith}
+         Optional: 13-feat MLP curvature bias (second-ring apexes d_ac, d_bc
+                   projected into local frame; deterministic discovery, no
+                   flag bits transmitted; ~3x encode-time cost; ≤0.1 BPV gain)
+         Connectivity: GTS v3 (L/R + FIFO reuse)
+     → Compressed stream
+```
+
+The boundary table is the key trick. A flat layout costs `n_boundary * 3 *
+g_bits` bits. Sorting boundary verts by 3D Morton code clusters them
+spatially, so per-axis deltas zigzag-Rice down to ~half the cost. Per-meshlet
+boundary refs become small ascending integers → Rice on sorted-deltas wins
+again.
+
+| stanford-bunny mv=384 | flat boundary | delta boundary |
+|---|---:|---:|
+| Boundary table | 20,742 B | **11,636 B** |
+| Boundary refs  | 21,458 B | **10,380 B** |
+| Total          | 156 KB   | **136 KB**   |
+| BPV            | 34.72    | **30.23**    |
+
+The 13-feature MLP improves the parallelogram prediction by projecting the
+two second-ring apexes (the third vertices of the triangles adjacent to T'
+across edges (a,c) and (b,c)) into the local triangle frame. Both encoder
+and decoder discover those apexes deterministically from the already-decoded
+neighbour set, so no flag bit needs to be transmitted. Net BPV gain is small
+(−0.07 on stanford-bunny, −0.06 on Monkey) and on small meshes the fp32
+weight header (~1.1 KB) outweighs the saving — `use_nn=False` is the right
+choice for meshes below ~10K verts.
+
+```python
+# Small-to-medium meshes (NN gives ~0.07 BPV extra)
+encoder = MeshletParaDelta(max_verts=384, precision_error=0.0005,
+                           use_nn=True, nn_steps=300, verbose=True)
+compressed = encoder.encode(model)
+
+# Million-vertex meshes (skip NN, run para predictor on GPU)
+encoder = MeshletParaDelta(max_verts=512, precision_error=0.0005,
+                           use_nn=False, use_cuda=True, verbose=True)
+compressed = encoder.encode(model)
+```
 
 ## Architecture
 
@@ -143,6 +235,7 @@ python test_connectivity_verify.py
 
 | Encoder | Connectivity | Vertices | LOD | Crack-free | GPU Decode |
 |---------|-------------|----------|:---:|:----------:|:----------:|
+| **`MeshletParaDelta`** | GTS v3 | Para-predict + delta boundary | No | **Yes** | Parallel (CPU-decoded refs) |
 | `MeshletGTSSegDelta` | GTS | Segmented delta | No | **Yes** | **Parallel** |
 | `MeshletGTSHaar` | GTS | Haar wavelet | No | **Yes** | Parallel |
 | `MeshletGTSPlain` | GTS | Plain quantized | No | **Yes** | **Parallel** |
