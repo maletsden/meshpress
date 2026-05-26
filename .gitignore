@@ -189,8 +189,12 @@ bench_cpp/blobs/
 bench_cpp/cache/
 bench_cpp/dump_out/
 
-# Third-party competitor SDKs (DGF-SDK, corto) — see bench_cpp/README.md for setup
-third_party/
+# Third-party competitor SDKs tracked as submodules under third_party/DGF-SDK and third_party/corto.
+# Anything else dropped under third_party/ (build artifacts, local checkouts) is ignored.
+third_party/*
+!third_party/DGF-SDK
+!third_party/corto
+!third_party/.gitkeep
 
 # LaTeX regenerable artifacts
 docs/paper_tex/submission_bundle/

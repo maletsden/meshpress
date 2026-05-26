@@ -1,0 +1,6 @@
+[submodule "third_party/DGF-SDK"]
+	path = third_party/DGF-SDK
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/DGF-SDK.git
+[submodule "third_party/corto"]
+	path = third_party/corto
+	url = https://github.com/cnr-isti-vclab/corto.git

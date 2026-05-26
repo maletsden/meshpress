@@ -1,396 +1,125 @@
-# MeshPress
+# MeshPress — STRIDE
 
-MeshPress is a 3D mesh compression library for real-time GPU decompression. It extends the AMD GPUOpen meshlet compression approach with two encoders that both beat the AMD baseline while remaining crack-free:
+**STRIDE** (STRIp-walked Triangulated Residual Integer Decoder) is a
+per-meshlet, GPU-decodable mesh compression format. One fused CUDA kernel
+decodes upward of **1.8 G triangles per second** on a consumer NVIDIA RTX 3090,
+producing vertex and index buffers in the layout expected by modern mesh-shader
+pipelines (DX12 / Vulkan / DirectX12 Ultimate).
 
-- **`MeshletGTSSegDelta`** — segmented-delta vertices on GTS connectivity. **24% better** compression than AMD baseline, GPU-parallel decode (~10 µs/meshlet on RTX 3090).
-- **`MeshletParaDelta`** — Touma-Gotsman parallelogram predictor on a boundary/interior split, with Morton-delta boundary coding and an optional 13-feature curvature MLP. **~6–10% better** compression than `GTSSegDelta` (29.34 vs 31.17 BPV on a 1.8M-vert tank model; 30.16 vs 32.49 on stanford-bunny), still crack-free. CUDA-accelerated encode via CuPy RawKernel — 33× speedup on the para predictor for million-vertex meshes.
+Compared head-to-head against AMD's Dense Geometry Format (DGF) on the same
+hardware, STRIDE is **strictly smaller on every test mesh** (1.38× to 1.93×
+fewer bytes) while remaining **within 6–17 %** of DGF's decode throughput on
+million-triangle inputs.
 
-## Features
+The implementation, full benchmark harness, and reproducibility recipe live in
+this repository. The design is documented in the paper at
+[`docs/paper_visual_computer_v6.md`](docs/paper_visual_computer_v6.md) (LaTeX
+submission bundle under [`docs/paper_tex/`](docs/paper_tex/)). The end-to-end
+reproduction recipe is in [`ARTIFACT.md`](ARTIFACT.md).
 
-- **Crack-free** meshlet compression via global quantization grid
-- **GPU-parallel** decompression using GTS strip decode (countbits/firstbithigh intrinsics)
-- **Segmented delta** vertex encoding: 24% smaller vertices than AMD baseline
-- **Parallelogram + delta-boundary** encoder: another ~7% on top of SegDelta
-- Controlled precision: guaranteed maximum reconstruction error
-- Scales to millions of polygons (tested on 1.8M vertex models)
+## Headline numbers
 
-## Installation
+Eight-mesh corpus at uniform 12-bit per-axis (bbox-relative) quantization,
+NVIDIA RTX 3090:
+
+| Mesh           | Tris    | STRIDE BPV | STRIDE GPU (M tris/s) | DGF BPV | DGF GPU (M tris/s) |
+|----------------|--------:|-----------:|----------------------:|--------:|-------------------:|
+| fandisk        | 13 K    |   45.68    |             67        |  71.96  |       474         |
+| stanford-bunny | 69 K    |   42.53    |            320        |  64.21  |     1,266         |
+| horse          | 97 K    |   41.61    |            456        |  59.66  |     1,225         |
+| Monkey         | 1.01 M  |   33.35    |          1,412        |  49.05  |     1,790         |
+| Happy Buddha   | 1.09 M  |   43.25    |          1,513        |  51.26  |     1,749         |
+| Crab           | 2.14 M  |   42.16    |          1,639        |  48.36  |     1,751         |
+| tank           | 3.51 M  |   34.07    |          1,708        |  49.04  |     2,001         |
+| xyz-dragon     | 7.22 M  |   33.62    |          1,810        |  46.39  |     2,169         |
+
+On the 7.2 M-triangle Stanford XYZ RGB Dragon: STRIDE 13.5 MB / 3.99 ms decode
+vs. DGF 18.7 MB / 3.33 ms. Full multi-codec comparison (Draco, meshoptimizer,
+Corto, gltfpack) is in paper §5.
+
+## Quick start
 
 ```bash
-git clone https://github.com/maletsden/meshpress.git
+git clone --recurse-submodules https://github.com/maletsden/meshpress.git
 cd meshpress
 pip install -r requirements.txt
-pip install scikit-learn cupy-cuda12x  # for meshlet encoders and GPU benchmarks
+python scripts/download_models.py --paper        # auto-fetch 5 of 8 paper meshes
+python scripts/bench_stride_decode_sweep.py      # GPU decode timing per mesh
+python scripts/bench_competitors.py              # full multi-codec sweep
 ```
 
-## Quick Usage
+Encode an OBJ into STRIDE bytes:
 
 ```python
-from reader import Reader
-from encoder import MeshletGTSSegDelta, MeshletGTSPlain
+from reader.fast_obj import load_mesh_npy, clean_mesh_npy
+from encoder.paradelta_codec import prepare_paradelta_arrays
+from encoder.paradelta_v5 import encode_from_prepared_v5
 
-model = Reader.read_from_file('assets/stanford-bunny.obj')
-
-# Our best: GTS connectivity + segmented delta vertices (crack-free, GPU-parallel)
-encoder = MeshletGTSSegDelta(max_verts=256, precision_error=0.0005, verbose=True)
-compressed = encoder.encode(model)
-
-# AMD baseline: GTS connectivity + plain quantized vertices (crack-free, GPU-parallel)
-encoder = MeshletGTSPlain(max_verts=256, precision_error=0.0005, verbose=True)
-compressed = encoder.encode(model)
-
-# Best compression: parallelogram predictor + delta boundary (crack-free)
-from encoder import MeshletParaDelta
-encoder = MeshletParaDelta(max_verts=384, precision_error=0.0005,
-                           use_nn=True, verbose=True)
-compressed = encoder.encode(model)
-
-# Million-vertex meshes: skip NN, run para predictor on GPU (CuPy)
-encoder = MeshletParaDelta(max_verts=512, precision_error=0.0005,
-                           use_nn=False, use_cuda=True, verbose=True)
-compressed = encoder.encode(model)
+verts, tris = load_mesh_npy("assets/stanford-bunny.obj")
+verts, tris = clean_mesh_npy(verts, tris)
+prep = prepare_paradelta_arrays(
+    verts, tris,
+    max_verts=256, max_tris=256, precision_error=0.0005,
+    gen_method="joint_learned", strip_method="multiseed",
+)
+data = encode_from_prepared_v5(prep, verbose=False)
+print(f"{len(data)} B, {len(data) * 8 / prep['n_v']:.2f} bpv")
 ```
 
-## Compression Benchmarks
-
-All encoders use **AMD GTS connectivity** (Generalized Triangle Strip with L/R flags + inc/reuse packing, ~6 bpt, GPU-parallel decode via bit intrinsics). The difference is vertex encoding only.
-
-### Full Pipeline (GTS connectivity + vertices, max_error=0.0005)
-
-| Model | Verts | Tris | AMD Baseline BPV | SegDelta BPV | Haar BPV | **ParaDelta BPV** | ParaDelta vs AMD |
-|-------|------:|-----:|-----------------:|-------------:|---------:|------------------:|-----------------:|
-| bunny | 2,503 | 4,968 | 47.34 | 41.53 | 42.28 | **37.19** | **+21.4%** |
-| torus | 3,840 | 7,680 | 56.48 | **39.07** | 38.56 | 39.94 | +29.3% |
-| stanford-bunny | 35,947 | 69,451 | 37.90 | 32.49 | 34.47 | **30.16** | **+20.4%** |
-| Monkey | 504,482 | 1,007,616 | 41.54 | 31.69 | 33.77 | **31.53** | **+24.1%** |
-| **tank** | **1,806,639** | **3,514,247** | — | 31.17 | — | **29.34** | **−5.9% vs SegDelta** |
-
-All crack-free (0 shared vertex mismatches verified). 100% within error target.
-`ParaDelta` is `MeshletParaDelta` at default settings (mv=384 with `use_nn=True`
-on bunny/stanford-bunny, mv=512 with `use_nn=False, use_cuda=True` on
-Monkey/tank). `SegDelta` still wins on `torus` because boundary refs cost more
-than interior gains save when triangle count is low.
-
-### Encode Speed (CPU vs CUDA Para Predictor)
-
-The para predictor is the per-meshlet causal hot loop. With `use_cuda=True`
-(CuPy + RawKernel, 32 threads/block, 1 thread per meshlet) it runs **bit-exactly**
-the same encoder on the GPU and produces the same output.
-
-| Mesh | CPU para | **GPU para** | Speedup | Total encode (CPU → GPU) |
-|------|---------:|-------------:|--------:|-------------------------:|
-| stanford-bunny (36K verts) | 6.0 s | — | — | — |
-| Monkey (504K verts) | 56 s | **1.7 s** | **33×** | 92 s → **36 s** |
-| tank (1.8M verts) | ~10 min (est.) | ~3 s (est.) | ~30× | ~10 min → **127 s** |
-
-The CUDA path is required to test `MeshletParaDelta` on million-vertex models in
-reasonable time — the CPU para predictor is O(meshlet_count × meshlet_size²) in
-practice. Phase A (vert ordering, sort, GTS connectivity) and meshlet generation
-are still pure-Python and dominate the remaining encode time.
-
-### Bits Breakdown (Monkey, GTS+SegDelta)
-
-| Component | Size | % | BPV | Description |
-|-----------|-----:|--:|----:|-------------|
-| Headers | 117 KB | 5.9% | 1.86 | Global + per-meshlet metadata |
-| Vertex data | 1,083 KB | 54.2% | 17.18 | Segmented delta encoded |
-| Connectivity | 798 KB | 39.9% | 12.66 | GTS: L/R flags + inc/reuse |
-| **Total** | **1,998 KB** | **100%** | **31.69** | **9.1x compression** |
-
-### Vertex Encoding Comparison (vertex data only, same GTS connectivity)
-
-| Method | S-Bunny | Monkey | vs Plain | GPU Parallel |
-|--------|--------:|-------:|---------:|:-------------|
-| Plain (AMD baseline) | 104 KB | 1,704 KB | — | Trivial (just read) |
-| **Segmented Delta** | **80 KB** | **1,083 KB** | **-36%** | **32 independent prefix sums** |
-| Haar Wavelet | 89 KB | 1,215 KB | -29% | log(N) steps, 6 syncs |
-| CDF 5/3 Wavelet | 91 KB | 1,228 KB | -28% | log(N) steps, 6 syncs |
-
-Segmented delta gives the best compression AND the fastest GPU decode: 32 independent segments decoded via prefix sum (2 syncs total vs 6 for wavelets).
-
-### GPU Decode Speed (RTX 3090, isolated timing)
-
-| Kernel | Stanford-Bunny (36K) | Monkey (504K) |
-|--------|---------------------:|------------------:|
-| AMD GTS+Plain (baseline) | 11.2 µs | 36.7 µs |
-| **GTS+SegDelta Opt v3 (ours)** | **9.8 µs** | **44.3 µs** |
-| GTS+Haar Opt v3 (ours) | ~10 µs | ~45 µs |
-
-Our segmented delta adds only **+21% decode overhead** on large meshes vs the plain AMD baseline, while providing **24% better compression**. On small meshes it's actually faster.
-
-## `MeshletParaDelta` — Best Compression (Crack-Free)
-
-`MeshletParaDelta` extends the meshlet pipeline with three ideas that, together,
-beat both `GTSSegDelta` and the AMD baseline by ~20–24% on real meshes:
-
-```
-Mesh → Global int-grid quantization (crack-free)
-     → Meshlet generation (greedy, max 384 verts default)
-     → Per meshlet:
-         Boundary / interior split
-         Boundary refs:  Morton-sort table → axis-delta + Rice
-         Interior verts: causal Touma-Gotsman parallelogram predictor
-                         residual = true − (a + b − c)
-                         per-axis best of {fixed, Rice, exp-Golomb, arith}
-         Optional: 13-feat MLP curvature bias (second-ring apexes d_ac, d_bc
-                   projected into local frame; deterministic discovery, no
-                   flag bits transmitted; ~3x encode-time cost; ≤0.1 BPV gain)
-         Connectivity: GTS v3 (L/R + FIFO reuse)
-     → Compressed stream
-```
-
-The boundary table is the key trick. A flat layout costs `n_boundary * 3 *
-g_bits` bits. Sorting boundary verts by 3D Morton code clusters them
-spatially, so per-axis deltas zigzag-Rice down to ~half the cost. Per-meshlet
-boundary refs become small ascending integers → Rice on sorted-deltas wins
-again.
-
-| stanford-bunny mv=384 | flat boundary | delta boundary |
-|---|---:|---:|
-| Boundary table | 20,742 B | **11,636 B** |
-| Boundary refs  | 21,458 B | **10,380 B** |
-| Total          | 156 KB   | **136 KB**   |
-| BPV            | 34.72    | **30.23**    |
-
-The 13-feature MLP improves the parallelogram prediction by projecting the
-two second-ring apexes (the third vertices of the triangles adjacent to T'
-across edges (a,c) and (b,c)) into the local triangle frame. Both encoder
-and decoder discover those apexes deterministically from the already-decoded
-neighbour set, so no flag bit needs to be transmitted. Net BPV gain is small
-(−0.07 on stanford-bunny, −0.06 on Monkey) and on small meshes the fp32
-weight header (~1.1 KB) outweighs the saving — `use_nn=False` is the right
-choice for meshes below ~10K verts.
+Decode on the GPU (CuPy CUDA):
 
 ```python
-# Small-to-medium meshes (NN gives ~0.07 BPV extra)
-encoder = MeshletParaDelta(max_verts=384, precision_error=0.0005,
-                           use_nn=True, nn_steps=300, verbose=True)
-compressed = encoder.encode(model)
-
-# Million-vertex meshes (skip NN, run para predictor on GPU)
-encoder = MeshletParaDelta(max_verts=512, precision_error=0.0005,
-                           use_nn=False, use_cuda=True, verbose=True)
-compressed = encoder.encode(model)
+from utils.paradelta_v5_cuda import ParaDeltaV5GpuDecoder
+dec = ParaDeltaV5GpuDecoder(data)
+v, t = dec.decode_to_host()    # numpy float32 positions + uint32 indices
 ```
 
-## Architecture
+## Repository layout
 
-### Encoding Pipeline
+| Path | Contents |
+|---|---|
+| `encoder/paradelta_v5.py`        | Reference STRIDE encoder (bit-exact with paper §3.6). |
+| `encoder/paradelta_codec.py`     | `prepare_paradelta_arrays` — partition + strip-walk + plan. |
+| `encoder/paradelta_v5_nb.py`     | Numba-JIT hot kernels for the encoder. |
+| `encoder/_irlp_fit.py`           | Integer-rational linear predictor (IRLP) per-mesh fit (paper §3.5). |
+| `utils/paradelta_v5_cuda.py`     | Fused CUDA decoder (paper §4). |
+| `utils/meshlet_gen_joint*.py`    | Joint-learned meshlet partitioner (paper §3.2). |
+| `utils/meshlet_plan_nb.py`       | Strip-emit traversal + AMD GTS-style connectivity. |
+| `reader/fast_obj.py`             | pandas-backed OBJ reader + `.cache.npz` sidecar. |
+| `scripts/bench_*.py`             | Bench harnesses. Each writes a CSV. |
+| `scripts/verify_*.py`            | Round-trip + crack-free verifiers. |
+| `scripts/viz/`                   | Paper figure generators (matplotlib). |
+| `bench_cpp/`                     | C++/CUDA bench binaries for STRIDE, DGF, and meshopt. See [`bench_cpp/README.md`](bench_cpp/README.md). |
+| `docs/paper_visual_computer_v6.md` | Paper (markdown). |
+| `docs/paper_tex/`                | Visual Computer LaTeX submission bundle. |
+| `docs/bitstream_spec.md`         | Standalone bitstream layout reference. |
+| `models/meshlet_gen_weights.json`| Joint-learned partitioner weights (paper §3.2). |
+| `ARTIFACT.md`                    | Reproducibility recipe (tables + figures). |
+| `legacy/`                        | Pre-STRIDE encoders (wavelet, LOD, ellipsoid). Not on the paper path. |
+| `third_party/DGF-SDK`            | AMD DGF reference (submodule). |
+| `third_party/corto`              | Corto codec (submodule). |
+
+## Building the C++ bench harness
+
+Required for the DGF GPU comparison and the C++ meshopt timings. See
+[`bench_cpp/README.md`](bench_cpp/README.md). Builds against CUDA 12 and either
+MSVC (Windows) or gcc / clang (Linux).
+
+## Citation
+
+Paper accepted-pending at **The Visual Computer** (Springer). Until publication:
+
+```bibtex
+@unpublished{stride2026,
+  author = {Maletskyi, Denys and Vyklyuk, Yaroslav and Li, Fengping},
+  title  = {{STRIDE}: {STRIp-walked} {Triangulated} {Residual} {Integer} {Decoder}
+            for {Per-Meshlet} {GPU} {Mesh} {Compression}},
+  year   = {2026},
+  note   = {Submitted to The Visual Computer (Springer)},
+  url    = {https://github.com/maletsden/meshpress}
+}
 ```
-Mesh → Global Quantization (crack-free integer grid)
-     → Meshlet Generation (greedy region growing, max 256 verts)
-     → Per meshlet:
-         BFS vertex ordering (spatial locality for delta encoding)
-         GTS strip generation (L/R flags + inc/reuse packing)
-         Vertex encoding: segmented delta on globally-quantized integers
-     → Compressed stream
-```
-
-### Per-Meshlet Compressed Format
-```
-┌── Meshlet Header (37 bytes)
-│   n_verts, n_tris, per-channel: base_min, base_bits, delta_min, delta_bits
-├── GTS Connectivity
-│   L/R flags:     1 bit per triangle (which edge reused)
-│   Inc flags:     1 bit per strip entry (new vertex vs reused)
-│   Reuse buffer:  uint8 per reused vertex (local index)
-├── Vertex Data (per channel x,y,z)
-│   Base stream:   32 anchor values × base_bits
-│   Delta stream:  (n_verts-32) deltas × delta_bits
-└── GPU decode: countbits + firstbithigh for connectivity
-               32 parallel prefix sums for vertices
-```
-
-### GPU Decode (1 CUDA block per meshlet, 256 threads)
-```
-Phase 1: Read header (1 thread → broadcast)               [1 sync]
-Phase 2: GTS connectivity decode (parallel, bit intrinsics) [0 syncs]
-Phase 3: Vertex base values (32 threads)                    [1 sync]
-Phase 4: Segment prefix sums (96 parallel: 32 segs × 3 ch) [1 sync]
-Phase 5: Global dequantize + write output (parallel)        [0 syncs]
-Total: 3 __syncthreads
-```
-
-### Crack-Free Guarantee
-
-All vertices are quantized to a **global integer grid** at encode time. The segmented delta encoding is **lossless on integers** (prefix sum exactly reconstructs the original sequence). Shared boundary vertices in different meshlets get the **same integer code** → identical float reconstruction → zero cracks.
-
-## Running Benchmarks
-
-```bash
-# Full encoder comparison on all models
-python test_final_benchmark.py
-
-# CUDA GPU decode speed benchmark (requires CuPy)
-python benchmark_cuda_decode.py
-
-# Wavelet/delta comparison
-python test_wavelet_meshlet_compression.py
-
-# Connectivity encode/decode verification
-python test_connectivity_verify.py
-```
-
-## Available Encoders
-
-| Encoder | Connectivity | Vertices | LOD | Crack-free | GPU Decode |
-|---------|-------------|----------|:---:|:----------:|:----------:|
-| **`MeshletParaDelta`** | GTS v3 | Para-predict + delta boundary | No | **Yes** | Parallel (CPU-decoded refs) |
-| `MeshletGTSSegDelta` | GTS | Segmented delta | No | **Yes** | **Parallel** |
-| `MeshletGTSHaar` | GTS | Haar wavelet | No | **Yes** | Parallel |
-| `MeshletGTSPlain` | GTS | Plain quantized | No | **Yes** | **Parallel** |
-| `MeshletWaveletGlobalEB` | EdgeBreaker | Int wavelet | No | **Yes** | Sequential |
-| `MeshletPlainAMD` | Raw packed | Global grid | No | **Yes** | Parallel |
-| **`MeshletLOD`** | FIFO-adjacency | Chain-delta + entropy | **Yes (5 levels)** | **Yes** | **Parallel** |
-
-## Progressive LOD Compression (`MeshletLOD`)
-
-`MeshletLOD` is a progressive Level-of-Detail encoder built on QEM simplification
-with synchronized boundary protection. A single compressed bitstream can be
-decoded at any of 5 resolution levels without re-encoding; every level produces
-a valid, crack-free triangulation covering the full mesh area.
-
-### Quick usage
-
-```python
-from reader import Reader
-from encoder import MeshletLOD, decode_lod
-from encoder.implementation.meshlet_wavelet import _to_numpy
-
-model = Reader.read_from_file('assets/stanford-bunny.obj')
-enc = MeshletLOD(max_verts=256, precision_error=0.0005, n_lod_levels=5, verbose=True)
-compressed = enc.encode(model)
-
-# Decode at a chosen LOD (0 = coarsest, 4 = full resolution)
-verts, tris = _to_numpy(model)
-out_verts, out_tris = decode_lod(verts, tris, compressed, lod_level=2)
-```
-
-### Algorithm
-
-```
-Mesh → Generate meshlets (greedy region growing, max 256 verts)
-     → Identify boundary vertices (shared between ≥2 meshlets)
-     → QEM on full mesh with boundary PROTECTED from collapse
-     → QEM on boundary subgraph alone (boundary-to-boundary collapses)
-     → Per meshlet:
-         Local AABB quantization for interior vertices
-         Chain-delta encoding of interior positions (delta from collapse parent)
-         FIFO-adjacency bitstream for connectivity
-     → Compact ancestor tables:
-         (collapse_step, direct_parent) per vertex
-         Entropy/exp-Golomb coded parent deltas
-```
-
-### Crack-free guarantees
-
-1. **Geometric** — boundary vertices use a global quantization grid, so the
-   same boundary vertex yields bit-identical positions in every meshlet.
-2. **Topological** — triangles are **redirected**, not dropped. When a vertex
-   collapses into its ancestor at low LOD, any triangle containing it gets
-   its vertex replaced by the ancestor. Triangles that become degenerate
-   disappear into neighbouring triangles; full area coverage is preserved.
-
-### Compression (all crack-free, 5 LOD levels, max_error=0.0005)
-
-| Model | Verts | Tris | BPV | Size | Non-LOD `GTSSegDelta` BPV | LOD overhead |
-|-------|------:|-----:|----:|-----:|------------------------:|-------------:|
-| bunny | 2,503 | 4,968 | 52.32 | 16 KB | 41.53 | +26% |
-| torus | 3,840 | 7,680 | 50.25 | 24 KB | 39.07 | +29% |
-| stanford-bunny | 35,947 | 69,451 | **49.80** | 224 KB | 32.49 | +53% |
-| Monkey | 504,482 | 1,007,616 | 50.69 | 3.1 MB | 31.69 | +60% |
-
-The ~25–60% BPV overhead vs a non-LOD encoder is the cost of progressive
-decode capability — a single bitstream covering 5 resolution levels instead
-of one fixed resolution.
-
-### Per-component breakdown (stanford-bunny)
-
-| Component | Size | % | Description |
-|-----------|-----:|--:|-------------|
-| Boundary positions | 24 KB | 11% | Global-quant, shared across meshlets |
-| Interior positions | 43 KB | 19% | Local-AABB quant + chain-delta |
-| Interior ancestors | 88 KB | 39% | Compact (collapse_step, parent) + entropy |
-| Boundary ancestors | 20 KB | 9% | Same format, separate chain |
-| Connectivity (FIFO) | 48 KB | 22% | Real AMD-style FIFO-adjacency bitstream |
-| **Total** | **224 KB** | **100%** | **5 LODs in one bitstream** |
-
-### LOD progression (stanford-bunny)
-
-| LOD | Verts | Tris | % of full |
-|----:|------:|-----:|----------:|
-| 0 | 3,004 | 3,727 | 5% |
-| 1 | 11,241 | 20,056 | 29% |
-| 2 | 19,476 | 36,520 | 53% |
-| 3 | 27,712 | 52,989 | 76% |
-| 4 | 35,947 | 69,451 | 100% |
-
-### GPU per-frame decompression (RTX 3090, CuPy kernels)
-
-Per-frame hot path: ancestor resolution (K1) → boundary composition (K2) →
-triangle redirection + emission (K3). All three kernels are embarrassingly
-parallel (1 thread per vertex or per triangle).
-
-| Model | LOD 0 total | LOD 4 total | Fused kernel | Throughput |
-|-------|------------:|------------:|-------------:|-----------:|
-| bunny (5K tris) | 65 µs | 80 µs | 24 µs | — |
-| torus (7.7K tris) | 58 µs | 70 µs | 23 µs | — |
-| stanford-bunny (70K tris) | 112 µs | 76 µs | 34 µs | ~900 M tri/s |
-| Monkey (1M tris) | 268 µs | 78 µs | 37 µs | **~12.8 G tri/s** |
-
-One-time mesh-load costs (connectivity decode + ancestor table upload) are
-separate and amortized over all frames.
-
-```bash
-python benchmark_cuda_a_fifo.py   # run the CUDA decompression benchmark
-```
-
-### GPU decode pipeline
-
-```
-Per-frame (parallel):
-  K1  1 thread / vertex    Walk compact collapse chain → interior ancestor
-  K1' 1 thread / vertex    Walk boundary chain → boundary ancestor
-  K2  1 thread / vertex    Compose: combined = bnd_anc[int_anc]
-  K3  1 thread / triangle  Redirect 3 verts, skip degenerate, emit
-
-One-time (at mesh load):
-  - Decode FIFO-adjacency connectivity into per-meshlet triangle lists
-  - Propagate chain-delta interior positions (roots → children)
-  - Upload ancestor tables, triangle list, positions to GPU
-```
-
-### Tradeoffs vs non-LOD `MeshletGTSSegDelta`
-
-| Aspect | `MeshletGTSSegDelta` | `MeshletLOD` |
-|--------|:-----:|:-----:|
-| BPV | 32 (stanford-bunny) | 50 |
-| LOD levels | 1 (fixed) | 5 (progressive) |
-| Crack-free | Yes | Yes (geometric + topological) |
-| GPU decode per frame | ~10 µs | ~80 µs |
-| GPU throughput | ~35 G tri/s | ~12 G tri/s |
-| Re-encoding for different LOD | Required | Not needed |
-| Use case | Static draws | Distance-based LOD |
-
-Choose `MeshletGTSSegDelta` when you only need one resolution level and
-absolute minimum size/fastest decode. Choose `MeshletLOD` when the camera
-distance varies and you want smooth transition between detail levels from
-a single compressed representation.
-
-## Legacy Encoders (vertex-only, bunny model)
-
-| Encoder Model | Bytes/tri | Bytes/vert | Ratio |
-|---------------|----------:|-----------:|------:|
-| BaselineEncoder | 18.05 | 35.82 | 1.00 |
-| PackedGTSQuantizator (radix) | 4.18 | 8.29 | 4.32 |
-| PackedGTSEllipsoidFitter(0.0005, 4) | **2.75** | **5.47** | **6.55** |
-
-![bytes_per_triangle_bar_plot](images/bytes_per_triangle_bar_plot.png) ![compression_rate_bar_plot](images/compression_rate_bar_plot.png)
 
 ## License
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
-
-## Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request.
+MIT. See [`LICENSE`](LICENSE).
