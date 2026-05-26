@@ -105,21 +105,6 @@ Required for the DGF GPU comparison and the C++ meshopt timings. See
 [`bench_cpp/README.md`](bench_cpp/README.md). Builds against CUDA 12 and either
 MSVC (Windows) or gcc / clang (Linux).
 
-## Citation
-
-Paper accepted-pending at **The Visual Computer** (Springer). Until publication:
-
-```bibtex
-@unpublished{stride2026,
-  author = {Maletskyi, Denys and Vyklyuk, Yaroslav and Li, Fengping},
-  title  = {{STRIDE}: {STRIp-walked} {Triangulated} {Residual} {Integer} {Decoder}
-            for {Per-Meshlet} {GPU} {Mesh} {Compression}},
-  year   = {2026},
-  note   = {Submitted to The Visual Computer (Springer)},
-  url    = {https://github.com/maletsden/meshpress}
-}
-```
-
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
