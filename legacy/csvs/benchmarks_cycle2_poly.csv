@@ -1,0 +1,13 @@
+model,n_verts,sort,poly_degree,total_bytes,bpv,encode_time_s
+bunny,2503,greedy_nn,0,15998,51.13,0.19
+bunny,2503,greedy_nn,1,16001,51.14,0.2
+bunny,2503,greedy_nn,2,16001,51.14,0.21
+bunny,2503,greedy_nn,3,16001,51.14,0.22
+stanford-bunny,35947,greedy_nn,0,201917,44.94,2.81
+stanford-bunny,35947,greedy_nn,1,201947,44.94,6.21
+stanford-bunny,35947,greedy_nn,2,201947,44.94,9.07
+stanford-bunny,35947,greedy_nn,3,201947,44.94,6.37
+Monkey,504482,greedy_nn,0,3087107,48.95,33.85
+Monkey,504482,greedy_nn,1,3087425,48.96,34.85
+Monkey,504482,greedy_nn,2,3087425,48.96,35.66
+Monkey,504482,greedy_nn,3,3087425,48.96,54.46

@@ -1,0 +1,16 @@
+model,n_verts,sort,total_bytes,bpv,encode_time_s
+bunny,2503,morton,16141,51.59,0.17
+bunny,2503,eb,16376,52.34,0.16
+bunny,2503,hilbert,16151,51.62,0.17
+bunny,2503,pca,16329,52.19,0.17
+bunny,2503,greedy_nn,15998,51.13,0.17
+stanford-bunny,35947,morton,207566,46.19,2.39
+stanford-bunny,35947,eb,214023,47.63,2.2
+stanford-bunny,35947,hilbert,208795,46.47,2.36
+stanford-bunny,35947,pca,211113,46.98,2.24
+stanford-bunny,35947,greedy_nn,201917,44.94,2.46
+Monkey,504482,morton,3191545,50.61,31.04
+Monkey,504482,eb,3168277,50.24,31.99
+Monkey,504482,hilbert,3222064,51.1,38.75
+Monkey,504482,pca,3202888,50.79,31.31
+Monkey,504482,greedy_nn,3087107,48.95,34.98

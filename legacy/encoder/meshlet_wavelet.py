@@ -633,20 +633,73 @@ class MeshletPlainAMD(Encoder):
 # Solution 1: Global quantize → integer wavelet (crack-free)
 # ============================================================
 
-def _global_quantize(vn, per_coord_err):
-    """Quantize all vertices to a global integer grid."""
+def _global_quantize(vn, per_coord_err, snap_mode="nn"):
+    """Quantize all vertices to a global integer grid.
+
+    snap_mode:
+      "nn":          round() at base step. Max axis err = step/2. Default.
+      "floor":       floor() at HALVED step (bits+1) — same err budget.
+      "halfstep_nn": round() at HALVED step (bits+1). For entropy_min.
+      "floor_base":  floor() at BASE step. Max axis err = step = 2x budget.
+                     Sacrifices accuracy contract for tighter codes.
+      "basestep_nn": NN at base step but flagged so entropy_min uses base
+                     step too (accepts 2x err for boundary verts only).
+    """
     global_min = vn.min(axis=0)
     global_max = vn.max(axis=0)
     global_range = global_max - global_min
     global_range[global_range < 1e-12] = 1e-12
     global_bits = np.array([_bits_for_error(global_range[d], per_coord_err)
                             for d in range(3)])
+    if snap_mode in ("floor", "halfstep_nn"):
+        global_bits = global_bits + 1  # halve step
     codes = np.zeros((len(vn), 3), dtype=np.int64)
     for d in range(3):
         mx = (1 << global_bits[d]) - 1
-        codes[:, d] = np.round((vn[:, d] - global_min[d]) / global_range[d] * mx
-                                ).clip(0, mx).astype(np.int64)
+        x = (vn[:, d] - global_min[d]) / global_range[d] * mx
+        if snap_mode in ("floor", "floor_base"):
+            codes[:, d] = np.floor(x).clip(0, mx).astype(np.int64)
+        else:
+            codes[:, d] = np.round(x).clip(0, mx).astype(np.int64)
     return codes, global_min, global_range, global_bits
+
+
+def _entropy_min_snap_boundary(vn, boundary_morton_order,
+                                global_min, global_range, global_bits):
+    """Re-snap boundary verts in Morton order at the half-step (bits+1)
+    grid: per axis, pick floor or ceil candidate minimizing |code - prev|
+    (PREV-SEQ). First vert: bias toward 0.
+
+    global_bits MUST already be the bits+1 (halved-step) value — caller
+    is responsible (pass the result of _global_quantize with snap_mode
+    in {"floor", "halfstep_nn"}).
+
+    Returns (n_bnd, 3) int64 codes in Morton order.
+    """
+    n = len(boundary_morton_order)
+    codes = np.zeros((n, 3), dtype=np.int64)
+    if n == 0:
+        return codes
+    mx_per_axis = np.array([(1 << int(global_bits[d])) - 1 for d in range(3)],
+                           dtype=np.int64)
+    prev = None
+    for i, gv in enumerate(boundary_morton_order):
+        v = vn[gv]
+        new = np.zeros(3, dtype=np.int64)
+        for d in range(3):
+            mx = mx_per_axis[d]
+            x = (v[d] - global_min[d]) / global_range[d] * mx
+            cf = int(np.clip(np.floor(x), 0, mx))
+            cc = int(np.clip(np.ceil(x), 0, mx))
+            if prev is None:
+                # Origin-bias: candidate with smaller |code| wins.
+                new[d] = cf if abs(cf) <= abs(cc) else cc
+            else:
+                p = int(prev[d])
+                new[d] = cf if abs(cf - p) < abs(cc - p) else cc
+        codes[i] = new
+        prev = new
+    return codes
 
 
 def _local_quantize_meshlet(positions, per_coord_err):
@@ -1211,8 +1264,14 @@ class MeshletSplitParaAMD(Encoder):
                  use_nn=False, nn_steps=300, nn_lr=1e-2,
                  boundary_codec="flat",
                  use_cuda=False,
+                 gen_method="greedy", max_tris=None,
+                 gen_weights=None, gen_feature_norms=None,
+                 preset_meshlets=None,
+                 strip_method="v2",
+                 snap_mode="nn",
                  verbose=False):
         self.max_verts = max_verts
+        self.max_tris = max_tris
         self.precision_error = precision_error
         self.conn = conn
         self.sort = sort  # only used to keep boundary ordering compatible
@@ -1221,6 +1280,18 @@ class MeshletSplitParaAMD(Encoder):
         self.nn_lr = nn_lr
         self.boundary_codec = boundary_codec  # "flat" | "delta"
         self.use_cuda = use_cuda
+        self.gen_method = gen_method
+        self.gen_weights = gen_weights
+        self.gen_feature_norms = gen_feature_norms
+        self.preset_meshlets = preset_meshlets
+        self.strip_method = strip_method
+        # snap_mode: "nn" | "floor" | "entropy_min"
+        #   nn          — round() at base step (current default).
+        #   floor       — floor() at half step. Bias toward 0.
+        #   entropy_min — half-step grid; boundary re-snapped per-vert in
+        #                 Morton order to minimize |code - prev_code|.
+        #                 Requires boundary_codec="delta".
+        self.snap_mode = snap_mode
         self.verbose = verbose
 
     def encode(self, model: Model) -> CompressedModel:
@@ -1245,13 +1316,36 @@ class MeshletSplitParaAMD(Encoder):
         vn = vc / scale
         per_coord_err = self.precision_error / scale / np.sqrt(3)
 
-        global_codes, g_min, g_range, g_bits = _global_quantize(vn, per_coord_err)
+        # Snap-mode dispatch. "entropy_min" needs the halved-step grid up
+        # front so the Morton sort + re-snap below sees consistent bits.
+        # "entropy_min_base" stays at base step (sacrifices the precision
+        # contract for tighter delta histograms).
+        _q_mode = self.snap_mode
+        if _q_mode == "entropy_min":
+            _q_mode_for_quant = "halfstep_nn"
+        elif _q_mode == "entropy_min_base":
+            _q_mode_for_quant = "nn"
+        else:
+            _q_mode_for_quant = _q_mode
+        global_codes, g_min, g_range, g_bits = _global_quantize(
+            vn, per_coord_err, snap_mode=_q_mode_for_quant)
 
         tri_adj = build_adjacency(tris_np)
         fn = compute_face_normals(vn, tris_np)
         fc = compute_face_centroids(vn, tris_np)
-        meshlets = generate_meshlets_by_verts(
-            tris_np, tri_adj, fn, fc, max_verts=self.max_verts)
+        if self.preset_meshlets is not None:
+            meshlets = self.preset_meshlets
+        else:
+            from utils.meshlet_generator import generate_meshlets as _gen_dispatch
+            meshlets = _gen_dispatch(
+                tris_np, tri_adj, fn, fc,
+                method=self.gen_method,
+                max_tris=self.max_tris,
+                max_verts=self.max_verts,
+                verts_np=vn,
+                weights=self.gen_weights,
+                feature_norms=self.gen_feature_norms,
+            )
 
         boundary_set = identify_boundary_verts(meshlets, tris_np)
         boundary_list, gv_to_ref, _bnd_codes = build_boundary_table(
@@ -1272,10 +1366,23 @@ class MeshletSplitParaAMD(Encoder):
             boundary_list, _ = morton_permute_boundary(
                 boundary_list, global_codes)
             gv_to_ref = {gv: i for i, gv in enumerate(boundary_list)}
+            # Entropy-min: re-snap boundary verts in Morton order. Per
+            # axis pick floor/ceil candidate closest to previous output.
+            # Updates global_codes IN PLACE for these verts so all
+            # downstream consumers see the new codes.
+            if self.snap_mode in ("entropy_min", "entropy_min_base") \
+                    and boundary_list:
+                new_bnd_codes = _entropy_min_snap_boundary(
+                    vn, boundary_list, g_min, g_range, g_bits)
+                for i, gv in enumerate(boundary_list):
+                    global_codes[gv] = new_bnd_codes[i]
             sorted_codes = (global_codes[boundary_list]
                             if boundary_list else np.zeros((0, 3), np.int64))
             bnd_table_bits = delta_boundary_table_bits(sorted_codes)
         else:
+            if self.snap_mode in ("entropy_min", "entropy_min_base"):
+                raise ValueError(
+                    "snap_mode='entropy_min*' requires boundary_codec='delta'")
             delta_refs_bits = None
             bnd_table_bits = boundary_table_bits(n_boundary, g_bits)
 
@@ -1338,7 +1445,8 @@ class MeshletSplitParaAMD(Encoder):
                                "gts_v3": "v3"}[self.conn]
                     conn_bits, _ = gts_encode_meshlet(
                         ml_tris, tris_np, tri_adj, local_to_global,
-                        variant=variant)
+                        variant=variant,
+                        strip_method=getattr(self, "strip_method", "v2"))
                 else:
                     conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
                 ml_conn_bits.append(conn_bits)
@@ -1479,7 +1587,8 @@ class MeshletSplitParaAMD(Encoder):
                                "gts_v3": "v3"}[self.conn]
                     conn_bits, _ = gts_encode_meshlet(
                         ml_tris, tris_np, tri_adj, local_to_global,
-                        variant=variant)
+                        variant=variant,
+                        strip_method=getattr(self, "strip_method", "v2"))
                 else:
                     conn_bits = _amd_packed_bits(ml_tris, tris_np, tri_adj)
                 total_conn_l += conn_bits
@@ -1582,7 +1691,13 @@ class MeshletParaDelta(MeshletSplitParaAMD):
     """
 
     def __init__(self, max_verts=384, precision_error=0.0005,
-                 use_nn=True, nn_steps=300, use_cuda=False, verbose=False):
+                 use_nn=True, nn_steps=300, use_cuda=False,
+                 gen_method="greedy", max_tris=None,
+                 gen_weights=None, gen_feature_norms=None,
+                 preset_meshlets=None,
+                 strip_method="v2",
+                 snap_mode="nn",
+                 verbose=False):
         super().__init__(
             max_verts=max_verts,
             precision_error=precision_error,
@@ -1592,6 +1707,13 @@ class MeshletParaDelta(MeshletSplitParaAMD):
             nn_steps=nn_steps,
             boundary_codec="delta",
             use_cuda=use_cuda,
+            gen_method=gen_method,
+            max_tris=max_tris,
+            gen_weights=gen_weights,
+            gen_feature_norms=gen_feature_norms,
+            preset_meshlets=preset_meshlets,
+            strip_method=strip_method,
+            snap_mode=snap_mode,
             verbose=verbose,
         )
 

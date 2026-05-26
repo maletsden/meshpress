@@ -207,6 +207,12 @@ docs/paper_tex/*.toc
 docs/paper_tex/*.fls
 docs/paper_tex/*.fdb_latexmk
 docs/paper_tex/*.synctex.gz
+docs/paper_tex/*.blg
+
+# Profiling output
+*.prof
+*.nvvp
+*.ncu-rep
 
 # Scratch directories
 dump_out/
