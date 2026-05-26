@@ -5,7 +5,6 @@ Per mesh, run every compressor we have, plus competitors:
   - MeshletWaveletGlobalEB (ours, encode-only timing; no fast GPU decoder)
   - MeshletWaveletGlobalAMD (ours, GPU decode via direct kernel run)
   - Draco q12 L7 (DracoPy, CPU decode timed)
-  - gltfpack -cc (meshopt EXT_meshopt_compression, encode-only)
   - AMD DGFTester tb12 (size; GPU speed cited from paper)
 
 Outputs:
@@ -13,7 +12,7 @@ Outputs:
   - Master CSV at bench_competitors.csv
 
 Notes:
-  * Sizes include format overhead (Draco/gltfpack carry headers); our format
+  * Sizes include format overhead (Draco carries headers); our format
     is raw compressed payload — caveat in paper.
   * Max error reported in *absolute* world coords (max-axis bbox basis).
   * GPU decode column: kernel-only, CUDA Events (cudaStreamSync at end).
@@ -37,6 +36,11 @@ sys.path.insert(0, str(ROOT))
 
 from reader.reader import Reader
 from utils.paradelta_cache import load_or_prepare
+from utils.bench_config import stride_precision, csv_suffix, mode_label
+
+_PREC = stride_precision()
+_SUFFIX = csv_suffix()
+print(f"[bench_competitors] STRIDE precision = {mode_label()}")
 from encoder.paradelta_v5 import encode_from_prepared_v5
 from utils.paradelta_v5_cuda import ParaDeltaV5GpuDecoder
 from encoder.implementation.meshlet_wavelet import (
@@ -46,6 +50,10 @@ from encoder.implementation.meshlet_wavelet import (
 
 DGFTESTER_EXE = (ROOT / "third_party" / "DGF-SDK" / "build" /
                  "DGFTester" / "Release" / "DGFTester.exe")
+CORTO_EXE = (ROOT / "third_party" / "corto" / "build" /
+              "Release" / "corto.exe")
+CORTOBENCH_EXE = (ROOT / "third_party" / "corto" / "build" /
+                   "Release" / "cortobench.exe")
 
 
 def _bpv(size_b: int, n_v: int) -> float:
@@ -71,9 +79,9 @@ def _read_mesh(path: str):
 
 def bench_paradelta_v5(path: str, n_v: int, n_t: int, warmup=20, runs=100):
     prep = load_or_prepare(path, max_verts=256, max_tris=256,
-                           precision_error=0.0005,
                            gen_method="joint_learned",
-                           strip_method="multiseed", verbose=False)
+                           strip_method="multiseed", verbose=False,
+                           **_PREC)
     t0 = time.perf_counter()
     data = encode_from_prepared_v5(prep, verbose=False)
     t_enc = time.perf_counter() - t0
@@ -229,33 +237,6 @@ def bench_meshopt(path: str, n_v: int, n_t: int, warmup=20, runs=100):
     }
 
 
-def bench_gltfpack(path: str, n_v: int, n_t: int):
-    if not shutil.which("gltfpack") and not shutil.which("gltfpack.cmd"):
-        return None
-    import trimesh
-    m = trimesh.load(path, process=False, force="mesh")
-    with tempfile.TemporaryDirectory() as td:
-        glb_in = Path(td) / "in.glb"
-        glb_out = Path(td) / "out.glb"
-        m.export(glb_in)
-        t0 = time.perf_counter()
-        r = subprocess.run(
-            ["gltfpack", "-i", str(glb_in), "-o", str(glb_out),
-             "-cc", "-si", "1.0"],
-            capture_output=True, text=True, shell=True)
-        t_enc = time.perf_counter() - t0
-        if r.returncode != 0:
-            return None
-        size = glb_out.stat().st_size
-    return {
-        "name": "gltfpack -cc",
-        "size_b": size, "bpv": _bpv(size, n_v),
-        "enc_ms": t_enc * 1000, "dec_us": None, "mtps": None,
-        "max_err": None,
-        "gpu": False, "note": "meshopt EXT (incl. glb headers)",
-    }
-
-
 def bench_dgf(path: str, n_v: int, n_t: int, tb=12):
     if not DGFTESTER_EXE.exists():
         return None
@@ -289,6 +270,104 @@ def bench_dgf(path: str, n_v: int, n_t: int, tb=12):
     }
 
 
+def _write_pos_ply(pts: np.ndarray, faces: np.ndarray, out_path: Path):
+    """Write a binary-little-endian PLY with just positions + tris."""
+    n_v, n_f = len(pts), len(faces)
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {n_v}\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        f"element face {n_f}\n"
+        "property list uchar int vertex_indices\n"
+        "end_header\n"
+    ).encode("ascii")
+    with open(out_path, "wb") as f:
+        f.write(header)
+        f.write(np.asarray(pts, dtype="<f4").tobytes())
+        face_rec = np.empty(n_f, dtype=[("c", "u1"), ("idx", "<i4", 3)])
+        face_rec["c"] = 3
+        face_rec["idx"] = np.asarray(faces, dtype="<i4")
+        f.write(face_rec.tobytes())
+
+
+def bench_corto(path: str, n_v: int, n_t: int, qb: int = 12):
+    """Corto (Ponchio & Dellepiane 2016) — academic edge-breaker codec.
+
+    The CLI's OBJ loader splits verts by (pos, normal, uv) triplets,
+    which inflates vert count vs our positions-only n_v. To keep BPV
+    apples-to-apples we re-emit a positions+faces-only PLY first and
+    drop normal/uv/color streams via -n 0 -u 0 -c 0.
+
+    Decode timing is parsed from Corto's own stdout
+    ("TOT M faces: ... in: Xms, Y MT/s") emitted under the -P
+    roundtrip mode.
+    """
+    if not CORTO_EXE.exists():
+        return None
+    _, pts, faces = _read_mesh(path)
+    with tempfile.TemporaryDirectory() as td:
+        ply_in  = Path(td) / "in.ply"
+        crt_out = Path(td) / "out.crt"
+        ply_rt  = Path(td) / "rt.ply"
+        _write_pos_ply(pts, faces, ply_in)
+
+        common = ["-v", str(qb), "-n", "0", "-u", "0", "-c", "0"]
+        # Encode-only run for size + enc time
+        t0 = time.perf_counter()
+        r1 = subprocess.run(
+            [str(CORTO_EXE)] + common + ["-o", str(crt_out), str(ply_in)],
+            capture_output=True, text=True)
+        t_enc = time.perf_counter() - t0
+        if r1.returncode != 0 or not crt_out.exists():
+            return None
+        size = crt_out.stat().st_size
+
+        # Sub-ms-accurate decode timing via cortobench.exe (in-process
+        # warm loop, 3 warmup + N timed). Falls back to parsing
+        # corto.exe -P output if cortobench is unavailable.
+        t_dec_us = None
+        max_err = None
+        if CORTOBENCH_EXE.exists():
+            runs = 100 if n_t < 200_000 else (
+                   20 if n_t < 2_000_000 else 5)
+            rb = subprocess.run(
+                [str(CORTOBENCH_EXE), str(crt_out), str(runs)],
+                capture_output=True, text=True)
+            if rb.returncode == 0:
+                import re
+                m = re.search(r"mean_us=([\d.]+)", rb.stdout or "")
+                if m:
+                    t_dec_us = float(m.group(1))
+        # Always run -P once to populate ply_rt for the max-err check
+        r2 = subprocess.run(
+            [str(CORTO_EXE)] + common + ["-P", str(ply_rt), str(ply_in)],
+            capture_output=True, text=True)
+        if t_dec_us is None and r2.returncode == 0:
+            import re
+            matches = re.findall(r"in:\s*([\d.]+)ms", r2.stdout or "")
+            if matches:
+                t_dec_us = float(matches[-1]) * 1000.0
+        if r2.returncode == 0 and ply_rt.exists():
+            try:
+                import trimesh
+                m = trimesh.load(str(ply_rt), process=False, force="mesh")
+                dec_pts = np.asarray(m.vertices, dtype=np.float32)
+                max_err = _max_err_nn(pts, dec_pts)
+            except Exception:
+                pass
+    return {
+        "name": f"Corto v{qb}",
+        "size_b": size, "bpv": _bpv(size, n_v),
+        "enc_ms": t_enc * 1000,
+        "dec_us": t_dec_us,
+        "mtps": (n_t / t_dec_us) if t_dec_us else None,
+        "max_err": max_err,
+        "gpu": False,
+        "note": "CPU decode (positions+faces only)",
+    }
+
+
 def fmt(v, kind):
     if v is None:
         return "—"
@@ -317,7 +396,8 @@ def print_mesh_table(name: str, n_v: int, n_t: int, rows: list[dict]):
 
 def run_one(path: str, csv_rows: list):
     name = Path(path).name
-    print(f"\n=== {name} ===")
+    obj_mb = Path(path).stat().st_size / 1e6
+    print(f"\n=== {name} ({obj_mb:.1f} MB) ===")
     _, pts, faces = _read_mesh(path)
     n_v, n_t = len(pts), len(faces)
     print(f"  verts={n_v:,} tris={n_t:,}")
@@ -329,8 +409,8 @@ def run_one(path: str, csv_rows: list):
         bench_global_eb,
         bench_draco,
         bench_meshopt,
-        bench_gltfpack,
         bench_dgf,
+        bench_corto,
     ):
         try:
             print(f"  running {fn.__name__}...", flush=True)
@@ -348,7 +428,8 @@ def run_one(path: str, csv_rows: list):
 
     print_mesh_table(name, n_v, n_t, rows)
     for r in rows:
-        csv_rows.append({"mesh": name, "n_v": n_v, "n_t": n_t, **r})
+        csv_rows.append({"mesh": name, "obj_mb": obj_mb,
+                          "n_v": n_v, "n_t": n_t, **r})
 
 
 def main():
@@ -375,9 +456,9 @@ def main():
             print(f"missing: {p}"); continue
         run_one(p, csv_rows)
 
-    out_csv = ROOT / "bench_competitors.csv"
+    out_csv = ROOT / f"bench_competitors{_SUFFIX}.csv"
     with open(out_csv, "w", newline="") as f:
-        keys = ["mesh", "n_v", "n_t", "name", "size_b", "bpv",
+        keys = ["mesh", "obj_mb", "n_v", "n_t", "name", "size_b", "bpv",
                 "max_err", "enc_ms", "dec_us", "mtps", "gpu", "note"]
         w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         w.writeheader()
