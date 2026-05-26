@@ -51,19 +51,13 @@ python scripts/bench_competitors.py              # full multi-codec sweep
 Encode an OBJ into STRIDE bytes:
 
 ```python
-from reader.fast_obj import load_mesh_npy, clean_mesh_npy
-from encoder.paradelta_codec import prepare_paradelta_arrays
-from encoder.paradelta_v5 import encode_from_prepared_v5
+from reader import Reader
+from encoder import STRIDEEncoder
 
-verts, tris = load_mesh_npy("assets/stanford-bunny.obj")
-verts, tris = clean_mesh_npy(verts, tris)
-prep = prepare_paradelta_arrays(
-    verts, tris,
-    max_verts=256, max_tris=256, precision_error=0.0005,
-    gen_method="joint_learned", strip_method="multiseed",
-)
-data = encode_from_prepared_v5(prep, verbose=False)
-print(f"{len(data)} B, {len(data) * 8 / prep['n_v']:.2f} bpv")
+model = Reader.read_from_file("assets/stanford-bunny.obj")
+enc   = STRIDEEncoder(max_verts=256, precision_error=0.0005)
+out   = enc.encode(model)
+print(f"{len(out.data)} B, {out.bits_per_vertex:.2f} bpv")
 ```
 
 Decode on the GPU (CuPy CUDA):

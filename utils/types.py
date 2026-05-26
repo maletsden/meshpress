@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
-from typing import List, Union
+from typing import List, Optional, Union
 import sys
+
+import numpy as np
 
 
 @dataclass
@@ -135,34 +137,96 @@ class AABB:
         return self.max - self.min
 
 
-@dataclass
 class Model:
-    vertices: List[Vertex] = field(default_factory=list)
-    triangles: List[Triangle] = field(default_factory=list)
+    """Mesh container. Numpy arrays are primary storage; list-of-Vertex and
+    list-of-Triangle views are lazily built (and cached) for back-compat
+    with legacy encoders.
 
-    triangle_strips: List[List[int]] = field(default_factory=list)
+    Construct via `Model.from_arrays(verts, tris)` or `Model.from_obj(path)`.
+    The two-positional-args constructor `Model(vertices, triangles)` accepts
+    either numpy arrays or `List[Vertex]` / `List[Triangle]` so existing
+    callers (e.g. `Model([], [])`) keep working unchanged.
+
+    Mutating the cached list views (`model.vertices.append(...)`) does NOT
+    propagate back to the numpy storage. Lists are read-only by convention.
+    """
+
+    __slots__ = ("vertices_np", "triangles_np", "triangle_strips",
+                 "_vertices_cache", "_triangles_cache")
+
+    def __init__(self,
+                 vertices: Optional[Union[np.ndarray, List["Vertex"]]] = None,
+                 triangles: Optional[Union[np.ndarray, List["Triangle"]]] = None,
+                 triangle_strips: Optional[List[List[int]]] = None):
+        self.vertices_np = self._coerce_verts(vertices)
+        self.triangles_np = self._coerce_tris(triangles)
+        self.triangle_strips = list(triangle_strips) if triangle_strips else []
+        self._vertices_cache = None
+        self._triangles_cache = None
+
+    @staticmethod
+    def _coerce_verts(v) -> np.ndarray:
+        if v is None or (isinstance(v, list) and len(v) == 0):
+            return np.zeros((0, 3), dtype=np.float64)
+        if isinstance(v, np.ndarray):
+            arr = np.ascontiguousarray(v, dtype=np.float64)
+            if arr.ndim != 2 or arr.shape[1] != 3:
+                raise ValueError(f"vertices ndarray must be (N, 3); got {arr.shape}")
+            return arr
+        return np.asarray([[p.x, p.y, p.z] for p in v], dtype=np.float64)
+
+    @staticmethod
+    def _coerce_tris(t) -> np.ndarray:
+        if t is None or (isinstance(t, list) and len(t) == 0):
+            return np.zeros((0, 3), dtype=np.int64)
+        if isinstance(t, np.ndarray):
+            arr = np.ascontiguousarray(t, dtype=np.int64)
+            if arr.ndim != 2 or arr.shape[1] != 3:
+                raise ValueError(f"triangles ndarray must be (M, 3); got {arr.shape}")
+            return arr
+        return np.asarray([[tr.a, tr.b, tr.c] for tr in t], dtype=np.int64)
 
     @property
-    def aabb(self) -> AABB:
-        aabb: AABB = AABB()
-        aabb.min.x = sys.float_info.max
-        aabb.min.y = sys.float_info.max
-        aabb.min.z = sys.float_info.max
-        aabb.max.x = sys.float_info.min
-        aabb.max.y = sys.float_info.min
-        aabb.max.z = sys.float_info.min
+    def vertices(self) -> List["Vertex"]:
+        if self._vertices_cache is None:
+            self._vertices_cache = [
+                Vertex(float(x), float(y), float(z))
+                for x, y, z in self.vertices_np
+            ]
+        return self._vertices_cache
 
-        for vertex in self.vertices:
-            aabb.min.x = min(vertex.x, aabb.min.x)
-            aabb.min.y = min(vertex.y, aabb.min.y)
-            aabb.min.z = min(vertex.z, aabb.min.z)
-            aabb.max.x = max(vertex.x, aabb.max.x)
-            aabb.max.y = max(vertex.y, aabb.max.y)
-            aabb.max.z = max(vertex.z, aabb.max.z)
+    @property
+    def triangles(self) -> List["Triangle"]:
+        if self._triangles_cache is None:
+            self._triangles_cache = [
+                Triangle(int(a), int(b), int(c))
+                for a, b, c in self.triangles_np
+            ]
+        return self._triangles_cache
 
-        return aabb
-    def copy(self) -> 'Model':
-        return Model(self.vertices.copy(), self.triangles.copy())
+    @classmethod
+    def from_arrays(cls, verts: np.ndarray, tris: np.ndarray) -> "Model":
+        return cls(verts, tris)
+
+    @classmethod
+    def from_obj(cls, path: str) -> "Model":
+        from reader.fast_obj import load_mesh_npy
+        v, t = load_mesh_npy(path)
+        return cls(v, t)
+
+    @property
+    def aabb(self) -> "AABB":
+        if len(self.vertices_np) == 0:
+            return AABB(Vertex(), Vertex())
+        lo = self.vertices_np.min(axis=0)
+        hi = self.vertices_np.max(axis=0)
+        return AABB(Vertex(float(lo[0]), float(lo[1]), float(lo[2])),
+                    Vertex(float(hi[0]), float(hi[1]), float(hi[2])))
+
+    def copy(self) -> "Model":
+        return Model(self.vertices_np.copy(),
+                     self.triangles_np.copy(),
+                     list(self.triangle_strips))
 
 @dataclass
 class CompressedModel:
