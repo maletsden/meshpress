@@ -181,13 +181,17 @@ def sort_by_morton(global_indices, global_codes):
     return [global_indices[i] for i in order]
 
 
-def gts_encode_meshlet(ml_tris, tris_np, tri_adj, local_to_global, variant="v1"):
+def gts_encode_meshlet(ml_tris, tris_np, tri_adj, local_to_global,
+                       variant="v1", strip_method="v2"):
     """Run AMD GTS encode with a caller-provided vertex order.
 
     variant:
         'v1' = original (flat 2-bit edge_code).
         'v2' = prefix-coded edge_code + dynamic-valence strip gen.
         'v3' = AMD L/R 1-bit + L/R-constrained strip gen + FIFO reuse.
+    strip_method (v3 only):
+        'v2' = generate_strips_v2 (default; dynamic-valence greedy)
+        'spiral' = BFS-ring serpentine inside meshlet
     Returns (bits, stream).
     """
     from utils.amd_gts import gts_encode, gts_encode_v2, gts_encode_v3
@@ -212,7 +216,8 @@ def gts_encode_meshlet(ml_tris, tris_np, tri_adj, local_to_global, variant="v1")
                 local_adj[li].append(tri_map[nb])
 
     if variant == "v3":
-        return gts_encode_v3(tris_local, local_adj, n_local)
+        return gts_encode_v3(tris_local, local_adj, n_local,
+                              strip_method=strip_method)
     if variant == "v2":
         return gts_encode_v2(tris_local, local_adj, n_local)
     return gts_encode(tris_local, local_adj, n_local)

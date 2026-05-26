@@ -248,8 +248,14 @@ def meshlet_bfs(meshlet_tris, tri_adj):
 # ============================================================
 
 def generate_meshlets_by_verts(tris_np, tri_adj, face_normals, face_centroids,
-                               max_verts=256, w_normal=0.6, w_edges=0.3, w_dist=0.1):
-    """Greedy region growing with max_verts as PRIMARY constraint."""
+                               max_verts=256, max_tris=None,
+                               w_normal=0.6, w_edges=0.3, w_dist=0.1):
+    """Greedy region growing.
+
+    Caps:
+        max_tris: primary cap (production constraint). If None, no tri cap.
+        max_verts: secondary cap (uint8 hard cap, default 256).
+    """
     n = len(tris_np)
     visited = np.zeros(n, dtype=bool)
     meshlets = []
@@ -284,13 +290,19 @@ def generate_meshlets_by_verts(tris_np, tri_adj, face_normals, face_centroids,
 
         push_neighbors(seed)
 
-        while pq and len(ml_verts) < max_verts:
+        while pq:
+            if max_tris is not None and len(ml_tris) >= max_tris:
+                break
+            if len(ml_verts) >= max_verts:
+                break
             _, _, cand = heapq.heappop(pq)
             if visited[cand]:
                 continue
 
             new_verts = set(int(v) for v in tris_np[cand]) - ml_verts
             if len(ml_verts) + len(new_verts) > max_verts:
+                continue
+            if max_tris is not None and len(ml_tris) + 1 > max_tris:
                 continue
 
             visited[cand] = True
@@ -307,6 +319,96 @@ def generate_meshlets_by_verts(tris_np, tri_adj, face_normals, face_centroids,
         meshlets.append(ml_tris)
 
     return meshlets
+
+
+# ============================================================
+# Unified dispatcher (greedy / tunneling / joint)
+# ============================================================
+
+def generate_meshlets(tris_np, tri_adj, face_normals, face_centroids,
+                      method="greedy", max_tris=256, max_verts=256,
+                      verts_np=None, weights=None, feature_norms=None):
+    """Unified meshlet generator.
+
+    Args:
+        method: "greedy" | "tunneling" | "joint"
+        max_tris: primary cap (production)
+        max_verts: secondary uint8 cap
+        verts_np: required for method="joint" (PCA plane fit)
+        weights: dict for method="joint" — {w1..w6}; defaults to uniform 1/6
+        feature_norms: dict for method="joint" — z-score sidecar
+
+    Returns:
+        List[List[int]] — list of meshlets, each a list of tri indices.
+    """
+    if method == "greedy":
+        return generate_meshlets_by_verts(
+            tris_np, tri_adj, face_normals, face_centroids,
+            max_verts=max_verts, max_tris=max_tris)
+
+    if method == "tunneling":
+        from utils.meshlet_tunneling import generate_meshlets_tunneling
+        return generate_meshlets_tunneling(
+            tris_np, tri_adj, max_tris=max_tris, max_verts=max_verts,
+            time_budget_s=300.0, verbose=True)
+
+    if method == "spiral":
+        from utils.meshlet_gen_spiral import generate_meshlets_spiral
+        return generate_meshlets_spiral(
+            tris_np, tri_adj, max_tris=max_tris, max_verts=max_verts,
+            face_centroids=face_centroids)
+
+    if method == "joint":
+        if verts_np is None:
+            raise ValueError("method='joint' requires verts_np")
+        from utils.meshlet_gen_joint import generate_meshlets_joint
+        return generate_meshlets_joint(
+            tris_np, tri_adj, face_normals, face_centroids, verts_np,
+            max_tris=max_tris, max_verts=max_verts,
+            weights=weights, feature_norms=feature_norms)
+
+    if method == "joint_learned":
+        if verts_np is None:
+            raise ValueError("method='joint_learned' requires verts_np")
+        from utils.meshlet_gen_joint import (
+            generate_meshlets_joint, LEARNED_WEIGHTS,
+        )
+        return generate_meshlets_joint(
+            tris_np, tri_adj, face_normals, face_centroids, verts_np,
+            max_tris=max_tris, max_verts=max_verts,
+            weights=weights or LEARNED_WEIGHTS, feature_norms=feature_norms)
+
+    if method == "joint+gnn":
+        if verts_np is None:
+            raise ValueError("method='joint+gnn' requires verts_np")
+        from utils.meshlet_gen_joint import generate_meshlets_joint
+        from utils.meshlet_gnn_fit import fit_partition_gnn
+        meshlets = generate_meshlets_joint(
+            tris_np, tri_adj, face_normals, face_centroids, verts_np,
+            max_tris=max_tris, max_verts=max_verts,
+            weights=weights, feature_norms=feature_norms)
+        return fit_partition_gnn(
+            meshlets, tris_np, tri_adj, face_normals, verts_np,
+            face_centroids=face_centroids,
+            max_tris=max_tris, max_verts=max_verts,
+            verbose=True)
+
+    if method == "joint+refine":
+        if verts_np is None:
+            raise ValueError("method='joint+refine' requires verts_np")
+        from utils.meshlet_gen_joint import generate_meshlets_joint
+        from utils.meshlet_refine_local import refine_local
+        meshlets = generate_meshlets_joint(
+            tris_np, tri_adj, face_normals, face_centroids, verts_np,
+            max_tris=max_tris, max_verts=max_verts,
+            weights=weights, feature_norms=feature_norms)
+        return refine_local(
+            meshlets, tris_np, tri_adj, face_normals, verts_np,
+            max_tris=max_tris, max_verts=max_verts,
+            weights=weights, feature_norms=feature_norms,
+            max_iters=20, verbose=True)
+
+    raise ValueError(f"unknown method: {method}")
 
 
 # ============================================================

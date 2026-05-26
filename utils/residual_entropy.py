@@ -1,29 +1,34 @@
 """Entropy-coding bit estimators for residual streams.
 
-Picks the minimum across {fixed-width, Rice(k), exp-Golomb(k),
-empirical entropy + arith-coder overhead} for a given int code array.
-Returns total bits and a small tag describing which coder won so the
-decoder can mirror.
+Picks the minimum across {fixed-width, Rice(k), exp-Golomb(k)} for a
+given int code array. Returns total bits and a small tag describing
+which coder won so the decoder can mirror.
 
-Assumed bitstream contract per axis:
+Earlier revisions included two unbuilt-coder estimators (tag 3 =
+empirical-entropy / rANS, tag 4 = static-Laplacian arithmetic). Plan 13
+ablation (2026-05-12) measured 0/5061 axes pick Laplacian on Monkey and
+≤0.01 BPV gain from the empirical-entropy estimator once a realistic
+PMF header is charged. Both removed: bitstream now only carries coders
+the encoder can actually emit. See memory/project_plan13_dead.md.
+
+Bitstream contract per axis:
     1 B  coder_tag   (uint8)
         0 : fixed-width with min-shift
         1 : Rice(k) on zigzag(codes)
         2 : exp-Golomb(k) on zigzag(codes)
-        3 : empirical-entropy (rANS / arithmetic) — adds 32 b overhead
-        4 : static-Laplacian arith — 16 b mu + 8 b log2 b (+16 b finish)
     if coder_tag == 0: + 2 B int16 min + 1 B uint8 bits_per_code
     if coder_tag in (1, 2): + 1 B uint8 k
-    if coder_tag == 3: + 32 b adaptive-coder overhead inside `bits`
-    if coder_tag == 4: + 16 b mu + 8 b log2 b + 16 b range-coder finish
 
 Decoder is symmetric and stateless within a single axis.
 """
 
 from __future__ import annotations
 
+import os
 import numpy as np
-from collections import Counter
+
+# Ablation hook: counts how many axes each coder wins. Reset by clearing.
+TAG_COUNTS = {0: 0, 1: 0, 2: 0}
 
 
 def _zigzag(n):
@@ -47,55 +52,6 @@ def _exp_golomb_bits(u, k):
                   np.floor(np.log2(shifted + 1)).astype(np.int64),
                   0)
     return int((2 * lb + 1 + k).sum())
-
-
-def _empirical_entropy_bits(codes):
-    n = len(codes)
-    if n == 0:
-        return 0
-    counts = Counter(codes.tolist())
-    probs = np.array(list(counts.values()), dtype=np.float64) / n
-    ent = -float(np.sum(probs * np.log2(probs)))
-    return int(np.ceil(n * ent)) + 32  # 32 b adaptive-coder overhead
-
-
-def _laplacian_arith_bits(codes):
-    """Bit cost of arithmetic coding `codes` against a static integer
-    Laplacian PMF whose scale `b` is fitted per stream.
-
-    The PMF is the discrete Laplacian
-        P(k) = exp(-|k - mu|/b) * (1 - exp(-1/b)) / (1 + exp(-1/b)) * 2  (k!=mu)
-        P(mu) = (1 - exp(-1/b)) / (1 + exp(-1/b))
-    integrated correctly (two-sided geometric). Mean is encoded as int16.
-
-    Header:
-        8 b tag + 16 b mu + 8 b log2-quantized b  →  32 b
-    Body: Shannon-bound under the Laplacian model, +16 b range-coder finish.
-    Tight upper bound on a real range-coder under this model (≤1 b/symbol
-    overhead in practice).
-    """
-    n = len(codes)
-    if n == 0:
-        return 0
-    mu = int(np.round(codes.mean()))
-    dev = np.abs(codes - mu).astype(np.float64)
-    b = max(1e-3, float(dev.mean()))
-    # log2 b, quantized to 8 bits over a sane range [-4, 12] (b in [1/16, 4096]).
-    log_b = np.clip(np.log2(b), -4.0, 12.0)
-    log_b_q = np.round((log_b + 4.0) / 16.0 * 255.0)
-    log_b_dq = log_b_q / 255.0 * 16.0 - 4.0
-    b_q = float(2.0 ** log_b_dq)
-    # -log2 P(k) = -log2(1 - r) + log2(1 + r) + |k-mu|/b * log2(e)   for k != mu
-    # -log2 P(mu) = -log2(1 - r) + log2(1 + r)                          for k == mu
-    # where r = exp(-1/b). Note P(mu)*(1+r) + sum_{k!=mu} P(k) = 1 by tail-sum.
-    r = float(np.exp(-1.0 / b_q))
-    # Normalising factor: -log2( (1 - r) / (1 + r) )
-    norm_bits = -np.log2(max(1.0 - r, 1e-30) / max(1.0 + r, 1e-30))
-    log2_e = 1.0 / np.log(2.0)
-    abs_dev = np.abs(codes - mu).astype(np.float64)
-    body_bits = float(n * norm_bits + abs_dev.sum() * log2_e / b_q)
-    body_bits = int(np.ceil(body_bits)) + 16  # range-coder finish overhead
-    return body_bits
 
 
 def best_axis_bits(codes):
@@ -134,18 +90,17 @@ def best_axis_bits(codes):
             eg_best = (b, k)
     eg_total = eg_best[0] + 8 + 8
 
-    # Empirical entropy (adaptive coder)
-    ent_total = _empirical_entropy_bits(codes) + 8
-
-    # Static Laplacian + arithmetic (8 b tag + 16 b mu + 8 b log2 b in body)
-    lap_total = _laplacian_arith_bits(codes) + 8 + 16 + 8
-
-    # Pick smallest. Tie-breakers: prefer simpler coder (fixed > rice > eg > ent > lap).
+    # Tie-breakers: prefer simpler coder (fixed > rice > eg).
     candidates = [
         (fixed_total, 0, fixed_bw),
         (rice_total, 1, rice_best[1]),
         (eg_total, 2, eg_best[1]),
-        (ent_total, 3, 0),
-        (lap_total, 4, 0),
     ]
-    return min(candidates, key=lambda t: t[0])
+    # Ablation: drop coders listed in RESIDUAL_DISABLE_TAGS (comma-sep).
+    disable_env = os.environ.get("RESIDUAL_DISABLE_TAGS", "")
+    if disable_env:
+        disabled = {int(t) for t in disable_env.split(",") if t.strip()}
+        candidates = [c for c in candidates if c[1] not in disabled]
+    best = min(candidates, key=lambda t: t[0])
+    TAG_COUNTS[best[1]] = TAG_COUNTS.get(best[1], 0) + 1
+    return best
