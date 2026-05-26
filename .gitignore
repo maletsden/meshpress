@@ -170,3 +170,41 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# AI-meta and internal planning artifacts (do not publish)
+.claude/
+CLAUDE.md
+docs/superpowers/
+docs/plans/
+docs/codec_rt/
+
+# bench_cpp compiled artifacts (regenerable via build_*.bat / build.sh)
+bench_cpp/*.exe
+bench_cpp/*.lib
+bench_cpp/*.obj
+bench_cpp/*.exp
+bench_cpp/*.dll
+bench_cpp/*.bak
+bench_cpp/blobs/
+bench_cpp/cache/
+bench_cpp/dump_out/
+
+# Third-party competitor SDKs (DGF-SDK, corto) — see bench_cpp/README.md for setup
+third_party/
+
+# LaTeX regenerable artifacts
+docs/paper_tex/submission_bundle/
+docs/paper_tex/tables_out/
+docs/paper_tex/*.zip
+docs/paper_tex/*.aux
+docs/paper_tex/*.log
+docs/paper_tex/*.out
+docs/paper_tex/*.toc
+docs/paper_tex/*.fls
+docs/paper_tex/*.fdb_latexmk
+docs/paper_tex/*.synctex.gz
+
+# Scratch directories
+dump_out/
+blobs/
+cache/

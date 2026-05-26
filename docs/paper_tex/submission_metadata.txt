@@ -1,0 +1,101 @@
+================================================================
+Editorial Manager submission metadata for The Visual Computer
+Paper: STRIDE (STRIp-walked Triangulated Residual Integer Decoder)
+================================================================
+
+----------------------------------------------------------------
+AFFILIATED INSTITUTIONS  (add both)
+----------------------------------------------------------------
+
+Affiliation 1 (primary for Maletskyi, Vyklyuk):
+  Institution name       : Lviv Polytechnic National University
+  Country / territory    : Ukraine
+  City                   : Lviv
+  Institution details    : (leave blank or add department if known)
+
+Affiliation 2 (primary for Li):
+  Institution name       : Zhejiang Lab for Regenerative Medicine
+  Country / territory    : China
+  City                   : Hangzhou      (Zhejiang Province)
+  Institution details    : (leave blank or add department if known)
+
+
+----------------------------------------------------------------
+AUTHORS (in order they appear on the manuscript)
+----------------------------------------------------------------
+
+Author 1  (CORRESPONDING)
+  Given names            : Denys
+  Family name            : Maletskyi
+  Email                  : denys.y.maletskyi@lpnu.ua
+  Primary affiliation    : Lviv Polytechnic National University
+  Other affiliation      : (none)
+  ORCID                  : 0009-0003-1685-0472
+
+Author 2
+  Given names            : Yaroslav
+  Family name            : Vyklyuk
+  Email                  : vyklyuk@ukr.net
+  Primary affiliation    : Lviv Polytechnic National University
+  Other affiliation      : (none)
+  ORCID                  : 0000-0003-4766-4659
+
+Author 3
+  Given names            : Fengping
+  Family name            : Li
+  Email                  : fpli@ojlab.ac.cn
+  Primary affiliation    : Zhejiang Lab for Regenerative Medicine
+  Other affiliation      : (none)
+  ORCID                  : 0000-0002-8535-112X
+
+
+----------------------------------------------------------------
+RESPONSIBLE CORRESPONDING AUTHOR
+----------------------------------------------------------------
+
+  Denys Maletskyi   (denys.y.maletskyi@lpnu.ua)
+
+
+----------------------------------------------------------------
+AUTHOR CONTRIBUTIONS STATEMENT (paste verbatim into EM textbox)
+----------------------------------------------------------------
+
+D.M. (lead researcher and corresponding author) conceived the STRIDE
+format, designed the encoder and CUDA decoder, implemented the full
+system, conducted all experiments, and drafted the manuscript. Y.V.
+and F.L. (academic supervisors) provided research guidance, advised on
+experimental methodology, and reviewed the manuscript. All authors
+read and approved the final manuscript.
+
+
+----------------------------------------------------------------
+KEYWORDS (paste into EM keywords field)
+----------------------------------------------------------------
+
+mesh compression; meshlet; GPU decode; parallelogram prediction;
+real-time rendering
+
+
+----------------------------------------------------------------
+DECLARATIONS (also present inside the manuscript)
+----------------------------------------------------------------
+
+Funding                : No specific funding received for this work.
+Competing interests    : None declared.
+Ethics approval        : Not applicable.
+Consent for publication: Not applicable.
+Data availability      : Test meshes from Stanford 3D Scanning
+                         Repository, Blender community assets, and
+                         Threedscans.com (CC0). Raw benchmark CSV
+                         files in the MeshPress public repository
+                         (https://github.com/maletsden/meshpress)
+                         under bench_*.csv.
+Code availability      : Full STRIDE encoder, decoder, CUDA kernels,
+                         and reproducibility scripts in the public
+                         MeshPress repository
+                         (https://github.com/maletsden/meshpress).
+Use of generative AI   : The authors used Anthropic's Claude to
+                         assist with text drafting. All scientific
+                         content is the work of the authors, who
+                         reviewed and edited the AI-generated text
+                         and take full responsibility.

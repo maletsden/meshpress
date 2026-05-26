@@ -1,0 +1,221 @@
+\begin{thebibliography}{10}
+\providecommand{\doi}[1]{\url{https://doi.org/#1}}
+\bibcommenthead
+
+\bibitem[\protect\citeauthoryear{{AMD GPUOpen}}{2024}]{ref01_amd_dgf_hpg2024}
+{AMD GPUOpen}.
+\newblock {DGF}: A Dense, Hardware-Friendly Geometry Format for Lossily
+  Compressing Meshlets with Arbitrary Topologies.
+\newblock In: High Performance Graphics (HPG) 2024. vol.~7; 2024. Available
+  from: \url{https://doi.org/10.1145/3675383}.
+
+\bibitem[\protect\citeauthoryear{{Google}}{2026}]{ref02_draco}
+{Google}.: Draco: 3D Data Compression.
+\newblock Accessed May 2026.
+\newblock Available from: \url{https://github.com/google/draco}.
+
+\bibitem[\protect\citeauthoryear{Ponchio}{2026}]{ref10_corto}
+Ponchio F.: Corto: A Library for Mesh Compression.
+\newblock Accessed May 2026.
+\newblock Available from: \url{https://github.com/cnr-isti-vclab/corto}.
+
+\bibitem[\protect\citeauthoryear{Rossignac}{1999}]{ref04_edgebreaker_1999}
+Rossignac J.
+\newblock Edgebreaker: Connectivity Compression for Triangle Meshes.
+\newblock IEEE Transactions on Visualization and Computer Graphics.
+  1999;5(1):47--61.
+\newblock \doi{10.1109/2945.764870}.
+
+\bibitem[\protect\citeauthoryear{Touma and
+  Gotsman}{1998}]{ref05_touma_gotsman_1998}
+Touma C, Gotsman C.
+\newblock Triangle Mesh Compression.
+\newblock In: Graphics Interface '98; 1998. p. 26--34.
+\newblock Available from: \url{https://doi.org/10.20380/GI1998.04}.
+
+\bibitem[\protect\citeauthoryear{Kapoulkine}{2026}]{ref03_meshoptimizer}
+Kapoulkine A.: meshoptimizer.
+\newblock Accessed May 2026.
+\newblock Available from: \url{https://github.com/zeux/meshoptimizer}.
+
+\bibitem[\protect\citeauthoryear{{AMD GPUOpen}}{2026}]{ref09_amd_dgf_blog}
+{AMD GPUOpen}.: Introducing AMD DGF Supercompression.
+\newblock Accessed May 2026.
+\newblock Available from:
+  \url{https://gpuopen.com/learn/introducing-amd-dgf-supercompression/}.
+
+\bibitem[\protect\citeauthoryear{Peng et~al.}{2005}]{ref14_peng_2005}
+Peng J, Kim CS, Kuo CCJ.
+\newblock Technologies for 3D Mesh Compression: A Survey.
+\newblock Journal of Visual Communication and Image Representation.
+  2005;16(6):688--733.
+\newblock \doi{10.1016/j.jvcir.2005.03.001}.
+
+\bibitem[\protect\citeauthoryear{Maglo et~al.}{2015}]{ref15_maglo_2015}
+Maglo A, Lavou{\'e} G, Dupont F, Hudelot C.
+\newblock 3D Mesh Compression: Survey, Comparisons, and Emerging Trends.
+\newblock ACM Computing Surveys. 2015;47(3):44:1--44:41.
+\newblock \doi{10.1145/2693443}.
+
+\bibitem[\protect\citeauthoryear{Taubin and
+  Rossignac}{1998}]{ref16_taubin_rossignac_1998}
+Taubin G, Rossignac J.
+\newblock Geometric Compression Through Topological Surgery.
+\newblock ACM Transactions on Graphics. 1998;17(2):84--115.
+\newblock \doi{10.1145/274363.274365}.
+
+\bibitem[\protect\citeauthoryear{Alliez and
+  Desbrun}{2001}]{ref17_alliez_desbrun_2001}
+Alliez P, Desbrun M.
+\newblock Valence-Driven Connectivity Encoding for 3D Meshes.
+\newblock Computer Graphics Forum (Eurographics). 2001;20(3):480--489.
+\newblock \doi{10.1111/1467-8659.00541}.
+
+\bibitem[\protect\citeauthoryear{Khodakovsky
+  et~al.}{2002}]{ref18_khodakovsky_2002}
+Khodakovsky A, Alliez P, Desbrun M, Schr{\"o}der P.
+\newblock Near-Optimal Connectivity Encoding of 2-Manifold Polygon Meshes.
+\newblock Graphical Models. 2002;64(3--4):147--168.
+\newblock \doi{10.1006/gmod.2002.0575}.
+
+\bibitem[\protect\citeauthoryear{Gumhold and
+  Stra{\ss}er}{1998}]{ref19_gumhold_strasser_1998}
+Gumhold S, Stra{\ss}er W.
+\newblock Real Time Compression of Triangle Mesh Connectivity.
+\newblock In: Proceedings of SIGGRAPH '98; 1998. p. 133--140.
+\newblock Available from: \url{https://doi.org/10.1145/280814.280836}.
+
+\bibitem[\protect\citeauthoryear{Deering}{1995}]{ref20_deering_1995}
+Deering MF.
+\newblock Geometry Compression.
+\newblock In: Proceedings of SIGGRAPH '95; 1995. p. 13--20.
+\newblock Available from: \url{https://doi.org/10.1145/218380.218391}.
+
+\bibitem[\protect\citeauthoryear{Isenburg and
+  Alliez}{2002}]{ref06_isenburg_alliez_2002}
+Isenburg M, Alliez P.
+\newblock Compressing Polygon Mesh Geometry with Parallelogram Prediction.
+\newblock In: IEEE Visualization 2002 (VIS '02); 2002. p. 141--146.
+\newblock Available from: \url{https://doi.org/10.1109/VISUAL.2002.1183768}.
+
+\bibitem[\protect\citeauthoryear{Cohen-Or et~al.}{2002}]{ref07_cohenor_2002}
+Cohen-Or D, Cohen R, Ironi R.
+\newblock Multi-Way Geometry Encoding.
+\newblock Tel Aviv University; 2002.
+\newblock Available from:
+  \url{https://citeseerx.ist.psu.edu/document?doi=04c844dafaf5e01f6da8adf37500573ead30d590}.
+
+\bibitem[\protect\citeauthoryear{Mamou et~al.}{2009}]{ref08_tfan_2009}
+Mamou K, Zaharia T, Pr{\^e}teux F.
+\newblock {TFAN}: A Low Complexity 3D Mesh Compression Algorithm.
+\newblock Computer Animation and Virtual Worlds. 2009;20(2--3):343--354.
+\newblock \doi{10.1002/cav.319}.
+
+\bibitem[\protect\citeauthoryear{Devillers and
+  Gandoin}{2000}]{ref12_devillers_gandoin_2000}
+Devillers O, Gandoin PM.
+\newblock Geometric Compression for Interactive Transmission.
+\newblock In: IEEE Visualization 2000; 2000. p. 319--326.
+\newblock Available from: \url{https://doi.org/10.1109/VISUAL.2000.885711}.
+
+\bibitem[\protect\citeauthoryear{Krivograd et~al.}{2008}]{ref13_krivograd_2008}
+Krivograd S, Trlep M, {\v{Z}}alik B.
+\newblock A Triangle Mesh Compression Algorithm with Vertex Prediction.
+\newblock Computing and Informatics. 2008;27(3):475--492.
+
+\bibitem[\protect\citeauthoryear{Sorkine et~al.}{2003}]{ref21_sorkine_2003}
+Sorkine O, Cohen-Or D, Toledo S.
+\newblock High-Pass Quantization for Mesh Encoding.
+\newblock In: Eurographics Symposium on Geometry Processing 2003; 2003. p.
+  42--51.
+\newblock Available from: \url{https://doi.org/10.2312/SGP/SGP03/042-051}.
+
+\bibitem[\protect\citeauthoryear{Witten et~al.}{1987}]{ref22_witten_1987}
+Witten IH, Neal RM, Cleary JG.
+\newblock Arithmetic Coding for Data Compression.
+\newblock Communications of the ACM. 1987;30(6):520--540.
+\newblock \doi{10.1145/214762.214771}.
+
+\bibitem[\protect\citeauthoryear{Martin}{1979}]{ref23_martin_1979}
+Martin GNN.
+\newblock Range Encoding: An Algorithm for Removing Redundancy from a Digitised
+  Message.
+\newblock In: Video and Data Recording Conference; 1979. Available from:
+  \url{https://www.drdobbs.com/cpp/range-coder/184409765}.
+
+\bibitem[\protect\citeauthoryear{Duda}{2013}]{ref24_duda_2013_ans}
+Duda J.: Asymmetric Numeral Systems: Entropy Coding Combining Speed of Huffman
+  Coding with Compression Rate of Arithmetic Coding.
+\newblock Available from: \url{https://arxiv.org/abs/1311.2540}.
+
+\bibitem[\protect\citeauthoryear{Rice and
+  Plaunt}{1971}]{ref25_rice_plaunt_1971}
+Rice RF, Plaunt JR.
+\newblock Adaptive Variable-Length Coding for Efficient Compression of
+  Spacecraft Television Data.
+\newblock IEEE Transactions on Communication Technology. 1971;19(6):889--897.
+\newblock \doi{10.1109/TCOM.1971.1090789}.
+
+\bibitem[\protect\citeauthoryear{Teuhola}{1978}]{ref26_teuhola_1978}
+Teuhola J.
+\newblock A Compression Method for Clustered Bit-Vectors.
+\newblock Information Processing Letters. 1978;7(6):308--311.
+\newblock \doi{10.1016/0020-0190(78)90024-8}.
+
+\bibitem[\protect\citeauthoryear{Hoppe}{1999}]{ref27_hoppe_1999}
+Hoppe H.
+\newblock Optimization of Mesh Locality for Transparent Vertex Caching.
+\newblock In: Proceedings of SIGGRAPH '99; 1999. p. 269--276.
+\newblock Available from: \url{https://doi.org/10.1145/311535.311565}.
+
+\bibitem[\protect\citeauthoryear{Forsyth}{2006}]{ref28_forsyth_2006}
+Forsyth T.: Linear-Speed Vertex Cache Optimisation.
+\newblock Accessed May 2026.
+\newblock Available from:
+  \url{https://tomforsyth1000.github.io/papers/fast_vert_cache_opt.html}.
+
+\bibitem[\protect\citeauthoryear{Stewart}{2001}]{ref11_stewart_2001}
+Stewart AJ.
+\newblock Tunneling for Triangle Strips in Continuous Level-of-Detail Meshes.
+\newblock In: Graphics Interface 2001; 2001. p. 91--100.
+\newblock Available from:
+  \url{https://graphicsinterface.org/wp-content/uploads/gi2001-11.pdf}.
+
+\bibitem[\protect\citeauthoryear{Geelnard}{2009}]{ref29_openctm}
+Geelnard M.: {OpenCTM}: The Open Compressed Triangle Mesh File Format.
+\newblock Accessed May 2026.
+\newblock Available from: \url{https://openctm.sourceforge.net}.
+
+\bibitem[\protect\citeauthoryear{{Khronos Group}}{2026}]{ref30_khr_draco}
+{Khronos Group}.: {KHR\_draco\_mesh\_compression} (glTF 2.0 extension).
+\newblock Accessed May 2026.
+\newblock Available from:
+  \url{https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_draco_mesh_compression}.
+
+\bibitem[\protect\citeauthoryear{Gu
+  et~al.}{2002}]{ref31_gu_2002_geometry_images}
+Gu X, Gortler SJ, Hoppe H.
+\newblock Geometry Images.
+\newblock ACM Transactions on Graphics (SIGGRAPH). 2002;21(3):355--361.
+\newblock \doi{10.1145/566654.566589}.
+
+\bibitem[\protect\citeauthoryear{Hoppe}{1996}]{ref32_hoppe_1996_progressive}
+Hoppe H.
+\newblock Progressive Meshes.
+\newblock In: Proceedings of SIGGRAPH '96; 1996. p. 99--108.
+\newblock Available from: \url{https://doi.org/10.1145/237170.237216}.
+
+\bibitem[\protect\citeauthoryear{Khodakovsky
+  et~al.}{2000}]{ref33_khodakovsky_2000_progressive}
+Khodakovsky A, Schr{\"o}der P, Sweldens W.
+\newblock Progressive Geometry Compression.
+\newblock In: Proceedings of SIGGRAPH '00; 2000. p. 271--278.
+\newblock Available from: \url{https://doi.org/10.1145/344779.344932}.
+
+\bibitem[\protect\citeauthoryear{Karis et~al.}{2021}]{ref34_nanite_2021}
+Karis B, Stubbe R, Wihlidal G.: Nanite: A Deep Dive.
+\newblock SIGGRAPH 2021 Advances in Real-Time Rendering Course Notes.
+\newblock Available from:
+  \url{https://advances.realtimerendering.com/s2021/Karis_Nanite_SIGGRAPH_Advances_2021_final.pdf}.
+
+\end{thebibliography}

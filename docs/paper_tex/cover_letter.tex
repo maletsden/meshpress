@@ -1,0 +1,31 @@
+\documentclass[11pt]{letter}
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{parskip}
+\usepackage{hyperref}
+
+\signature{Denys Maletskyi \\ Lviv Polytechnic National University \\ denys.y.maletskyi@lpnu.ua}
+\address{Denys Maletskyi \\ Lviv Polytechnic National University \\ Lviv, Ukraine}
+
+\begin{document}
+
+\begin{letter}{Editor-in-Chief \\ \textit{The Visual Computer} \\ Springer Nature}
+
+\opening{Dear Editor,}
+
+On behalf of my co-authors, I am pleased to submit our manuscript, ``\textbf{STRIDE: STRIp-walked Triangulated Residual Integer Decoder for Per-Meshlet GPU Mesh Compression},'' for consideration as an Original Article in \textit{The Visual Computer}.
+
+The work presents a per-meshlet, GPU-decodable mesh compression format aimed at the same regime as AMD's recently published Dense Geometry Format (DGF): per-frame on-device decoding into mesh-shader-ready vertex and index buffers, with random access at the meshlet granularity. STRIDE composes mesh-shader-sized partitioning, packed-local-index connectivity, a single bounding-box-relative 12-bit integer quantization, an integer-rational linear predictor (IRLP) that subsumes the classical parallelogram as a bit-exact special case, and axis-separated Rice / Exp-Golomb residual coding into a single fused CUDA kernel.
+
+Benchmarked head-to-head against DGF on the same NVIDIA RTX 3090, STRIDE is strictly smaller on every mesh in the evaluation corpus (1.38$\times$ to 1.93$\times$) while remaining within 6--17\% of DGF's decode throughput on million-triangle inputs. To the best of our knowledge, this is the first published per-meshlet GPU-decode format that simultaneously matches DGF's decode interface and improves on its byte size at the matched precision budget.
+
+We believe the work fits the scope of \textit{The Visual Computer} for three reasons. First, the format is directly relevant to real-time rendering and visualization, the journal's core readership. Second, it advances the young but rapidly growing area of meshlet-native GPU codecs, in which the published baselines are very recent (DGF, 2024) and where rigorous head-to-head comparison is still missing from the literature. Third, the contribution is empirical and reproducible: all code, the bitstream specification, the raw benchmark CSV files, and the test corpus are released in the public \textbf{MeshPress} repository at \url{https://github.com/maletsden/meshpress}, in line with the journal's data-availability and code-availability policies.
+
+We confirm that this manuscript is original, has not been published elsewhere, and is not under review at any other journal. All authors have read and approved the submission and declare no competing interests. We have disclosed our limited use of generative AI for prose drafting in the manuscript.
+
+Thank you for considering our submission. We look forward to the reviewers' feedback.
+
+\closing{Sincerely,}
+
+\end{letter}
+
+\end{document}
