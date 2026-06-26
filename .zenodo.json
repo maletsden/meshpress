@@ -1,0 +1,38 @@
+{
+  "title": "MeshPress: STRIDE — STRIp-walked Triangulated Residual Integer Decoder for Per-Meshlet GPU Mesh Compression",
+  "description": "Reference implementation of STRIDE, a per-meshlet self-contained mesh compression format designed for per-frame GPU decompression, with the encoder, fused CUDA decoder, bitstream specification, eight-mesh benchmark harness, and the scripts that regenerate every table and figure in the accompanying article in The Visual Computer (Springer).",
+  "upload_type": "software",
+  "license": "MIT",
+  "access_right": "open",
+  "creators": [
+    {
+      "name": "Maletskyi, Denys",
+      "orcid": "0009-0003-1685-0472",
+      "affiliation": "Lviv Polytechnic National University"
+    },
+    {
+      "name": "Vyklyuk, Yaroslav",
+      "orcid": "0000-0003-4766-4659",
+      "affiliation": "Lviv Polytechnic National University"
+    },
+    {
+      "name": "Li, Fengping",
+      "orcid": "0000-0002-8535-112X",
+      "affiliation": "Zhejiang Lab for Regenerative Medicine"
+    }
+  ],
+  "keywords": [
+    "mesh compression",
+    "meshlet",
+    "GPU decode",
+    "parallelogram prediction",
+    "real-time rendering"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/maletsden/meshpress",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}

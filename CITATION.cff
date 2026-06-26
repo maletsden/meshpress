@@ -1,0 +1,50 @@
+cff-version: 1.2.0
+message: "If you use MeshPress/STRIDE, please cite the article below."
+title: "MeshPress: STRIDE GPU mesh compression"
+abstract: >-
+  MeshPress is the reference implementation of STRIDE (STRIp-walked
+  Triangulated Residual Integer Decoder), a per-meshlet self-contained mesh
+  compression format designed for per-frame GPU decompression, together with
+  the benchmark harness and reproducibility scripts for the accompanying
+  article in The Visual Computer.
+type: software
+authors:
+  - family-names: Maletskyi
+    given-names: Denys
+    orcid: "https://orcid.org/0009-0003-1685-0472"
+    affiliation: "Lviv Polytechnic National University"
+  - family-names: Vyklyuk
+    given-names: Yaroslav
+    orcid: "https://orcid.org/0000-0003-4766-4659"
+    affiliation: "Lviv Polytechnic National University"
+  - family-names: Li
+    given-names: Fengping
+    orcid: "https://orcid.org/0000-0002-8535-112X"
+    affiliation: "Zhejiang Lab for Regenerative Medicine"
+license: MIT
+repository-code: "https://github.com/maletsden/meshpress"
+version: "1.0.0"
+date-released: "2026-06-27"
+keywords:
+  - mesh compression
+  - meshlet
+  - GPU decode
+  - parallelogram prediction
+  - real-time rendering
+preferred-citation:
+  type: article
+  title: "STRIDE: STRIp-walked Triangulated Residual Integer Decoder for Per-Meshlet GPU Mesh Compression"
+  authors:
+    - family-names: Maletskyi
+      given-names: Denys
+      orcid: "https://orcid.org/0009-0003-1685-0472"
+    - family-names: Vyklyuk
+      given-names: Yaroslav
+      orcid: "https://orcid.org/0000-0003-4766-4659"
+    - family-names: Li
+      given-names: Fengping
+      orcid: "https://orcid.org/0000-0002-8535-112X"
+  journal: "The Visual Computer"
+  publisher:
+    name: "Springer"
+  year: 2026
