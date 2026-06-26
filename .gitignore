@@ -1,5 +1,8 @@
-# Assets
-/assets
+# Assets — meshes are fetched via scripts/download_models.py, not committed.
+# Keep the dataset README and a .gitkeep tracked so the corpus is documented.
+/assets/*
+!/assets/README.md
+!/assets/.gitkeep
 
 # Pickles
 /pickles

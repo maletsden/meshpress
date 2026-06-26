@@ -1,11 +1,5 @@
 # STRIDE: STRIp-walked Triangulated Residual Integer Decoder for Per-Meshlet GPU Mesh Compression
 
-*Target venue: The Visual Computer (Springer). This document is a content draft; formatting (svjour3, BibTeX, figure placement) is deferred to camera-ready.*
-
-*v6 (2026-05-25): editorial pass over v5. Abstract trimmed to under 250 words, three-regime taxonomy consolidated to a single occurrence, §4.1 reduced to a parallelism summary, "structural" terminology varied, two §6.4 items reframed as open research questions, URL-only references annotated. Related Work expanded with additional citations across connectivity, prediction, entropy, and surveys. DGF throughput framing clarified (43 M tris/s is AMD's published single-core CPU decode [9]; 1.5–2.2 G tris/s is our isolated GPU decode of a custom DGF implementation).*
-
-*v7 (2026-06-04): pre-peer-review revision for The Visual Computer. Added a Code and Data Availability section (§8) and an availability note in the abstract; added three Visual Computer connectivity-coding references [35–37]; corrected the §5.2 meshoptimizer comparison to agree with Table 3; corrected the DGF reference-throughput attribution — ref [9] reports single-core CPU decode times (≈43 M tris/s on a Ryzen 9 7950X), not GPU end-to-end rendering, and lists no BPV figure — in §1 and §5.3; reconciled the Dragon compressed-size figures with §5.6; scoped the "6–17 %" throughput claim to the DGF-benchmark meshes; fixed the competitor counts in §5 and a cross-reference in §6.4.*
-
 ---
 
 ## Authors and affiliations
@@ -454,7 +448,7 @@ The mechanism underlying these results is the composition of four ingredients (m
 
 ## 8. Code and Data Availability
 
-All source code, the STRIDE bitstream specification, the test-mesh corpus, raw benchmark CSV files, and the scripts that regenerate every table and figure in this paper are publicly available in the **MeshPress** repository at <https://github.com/maletsden/meshpress>, released under the MIT license and archived with a permanent DOI on Zenodo <!-- TODO: insert Zenodo DOI once minted; cite as the archival reference --> (DOI to be assigned).
+All source code, the STRIDE bitstream specification, the test-mesh corpus, raw benchmark CSV files, and the scripts that regenerate every table and figure in this paper are publicly available in the **MeshPress** repository at <https://github.com/maletsden/meshpress>, released under the MIT license and archived with a permanent DOI on Zenodo (DOI: [INSERT ZENODO DOI]).
 
 The repository documents:
 

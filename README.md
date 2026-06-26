@@ -9,7 +9,7 @@ pipelines (DX12 / Vulkan / DirectX12 Ultimate).
 Compared head-to-head against AMD's Dense Geometry Format (DGF) on the same
 hardware, STRIDE is **strictly smaller on every test mesh** (1.38× to 1.93×
 fewer bytes) while remaining **within 6–17 %** of DGF's decode throughput on
-million-triangle inputs.
+the meshes of AMD's DGF benchmark suite.
 
 The implementation, full benchmark harness, and reproducibility recipe live in
 this repository. The design is documented in the paper at
@@ -33,8 +33,8 @@ NVIDIA RTX 3090:
 | tank           | 3.51 M  |   34.07    |          1,708        |  49.04  |     2,001         |
 | xyz-dragon     | 7.22 M  |   33.62    |          1,810        |  46.39  |     2,169         |
 
-On the 7.2 M-triangle Stanford XYZ RGB Dragon: STRIDE 13.5 MB / 3.99 ms decode
-vs. DGF 18.7 MB / 3.33 ms. Full multi-codec comparison (Draco, meshoptimizer,
+On the 7.2 M-triangle Stanford XYZ RGB Dragon: STRIDE 14.5 MB / 3.99 ms decode
+vs. DGF 20.0 MB / 3.33 ms. Full multi-codec comparison (Draco, meshoptimizer,
 Corto, gltfpack) is in paper §5.
 
 ## Quick start
@@ -98,6 +98,29 @@ v, t = dec.decode_to_host()    # numpy float32 positions + uint32 indices
 Required for the DGF GPU comparison and the C++ meshopt timings. See
 [`bench_cpp/README.md`](bench_cpp/README.md). Builds against CUDA 12 and either
 MSVC (Windows) or gcc / clang (Linux).
+
+## Citation
+
+If you use STRIDE or MeshPress in your research, please cite the accompanying
+article in *The Visual Computer* (Springer):
+
+> Maletskyi, D., Vyklyuk, Y., Li, F. *STRIDE: STRIp-walked Triangulated Residual
+> Integer Decoder for Per-Meshlet GPU Mesh Compression.* The Visual Computer
+> (Springer). Under review.
+
+```bibtex
+@article{maletskyi_stride,
+  title     = {{STRIDE}: {STRIp}-walked Triangulated Residual Integer Decoder
+               for Per-Meshlet {GPU} Mesh Compression},
+  author    = {Maletskyi, Denys and Vyklyuk, Yaroslav and Li, Fengping},
+  journal   = {The Visual Computer},
+  publisher = {Springer},
+  note      = {Under review}
+}
+```
+
+<!-- TODO: on acceptance, add volume/number/pages/year/DOI; add the Zenodo
+software DOI as a second citation entry. -->
 
 ## License
 

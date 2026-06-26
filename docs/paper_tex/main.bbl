@@ -78,12 +78,39 @@ Khodakovsky A, Alliez P, Desbrun M, Schr{\"o}der P.
 \newblock Graphical Models. 2002;64(3--4):147--168.
 \newblock \doi{10.1006/gmod.2002.0575}.
 
+\bibitem[\protect\citeauthoryear{Szymczak}{2003}]{ref35_szymczak_2003}
+Szymczak A.
+\newblock Optimized Edgebreaker encoding for large and regular triangle meshes.
+\newblock The Visual Computer. 2003;19(4):271--278.
+\newblock \doi{10.1007/s00371-003-0208-0}.
+
 \bibitem[\protect\citeauthoryear{Gumhold and
   Stra{\ss}er}{1998}]{ref19_gumhold_strasser_1998}
 Gumhold S, Stra{\ss}er W.
 \newblock Real Time Compression of Triangle Mesh Connectivity.
 \newblock In: Proceedings of SIGGRAPH '98; 1998. p. 133--140.
 \newblock Available from: \url{https://doi.org/10.1145/280814.280836}.
+
+\bibitem[\protect\citeauthoryear{Coors and
+  Rossignac}{2004}]{ref36_coors_delphi_2004}
+Coors V, Rossignac J.
+\newblock Delphi: geometry-based connectivity prediction in triangle mesh
+  compression.
+\newblock The Visual Computer. 2004;20(8--9):507--520.
+\newblock \doi{10.1007/s00371-004-0255-1}.
+
+\bibitem[\protect\citeauthoryear{Balreira and
+  da~Silveira}{2024}]{ref37_balreira_2024}
+Balreira DG, da~Silveira TLT.
+\newblock Triangular matrix-based lossless compression algorithm for 3{D} mesh
+  connectivity.
+\newblock The Visual Computer. 2024;40(6):3961--3970.
+\newblock \doi{10.1007/s00371-024-03400-8}.
+
+\bibitem[\protect\citeauthoryear{Geelnard}{2009}]{ref29_openctm}
+Geelnard M.: {OpenCTM}: The Open Compressed Triangle Mesh File Format.
+\newblock Accessed May 2026.
+\newblock Available from: \url{https://openctm.sourceforge.net}.
 
 \bibitem[\protect\citeauthoryear{Deering}{1995}]{ref20_deering_1995}
 Deering MF.
@@ -180,11 +207,6 @@ Stewart AJ.
 \newblock In: Graphics Interface 2001; 2001. p. 91--100.
 \newblock Available from:
   \url{https://graphicsinterface.org/wp-content/uploads/gi2001-11.pdf}.
-
-\bibitem[\protect\citeauthoryear{Geelnard}{2009}]{ref29_openctm}
-Geelnard M.: {OpenCTM}: The Open Compressed Triangle Mesh File Format.
-\newblock Accessed May 2026.
-\newblock Available from: \url{https://openctm.sourceforge.net}.
 
 \bibitem[\protect\citeauthoryear{{Khronos Group}}{2026}]{ref30_khr_draco}
 {Khronos Group}.: {KHR\_draco\_mesh\_compression} (glTF 2.0 extension).
