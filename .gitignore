@@ -221,3 +221,6 @@ docs/paper_tex/*.blg
 dump_out/
 blobs/
 cache/
+
+# Editor-facing response letter (not for public repo)
+docs/tvc_response_letter.*

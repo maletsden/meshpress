@@ -454,7 +454,7 @@ The mechanism underlying these results is the composition of four ingredients (m
 
 ## 8. Code and Data Availability
 
-All source code, the STRIDE bitstream specification, the test-mesh corpus, raw benchmark CSV files, and the scripts that regenerate every table and figure in this paper are publicly available in the **MeshPress** repository at <https://github.com/maletsden/meshpress>, released under the MIT license and archived with a permanent DOI on Zenodo <!-- TODO: insert Zenodo DOI once minted; cite as the archival reference --> (DOI to be assigned).
+All source code, the STRIDE bitstream specification, the test-mesh corpus, raw benchmark CSV files, and the scripts that regenerate every table and figure in this paper are publicly available in the **MeshPress** repository at <https://github.com/maletsden/meshpress>, released under the MIT license and archived with a permanent DOI on Zenodo (DOI: [10.5281/zenodo.20942759](https://doi.org/10.5281/zenodo.20942759)).
 
 The repository documents:
 

@@ -1,5 +1,7 @@
 # MeshPress — STRIDE
 
+[![DOI](https://zenodo.org/badge/878885519.svg)](https://doi.org/10.5281/zenodo.20942759)
+
 **STRIDE** (STRIp-walked Triangulated Residual Integer Decoder) is a
 per-meshlet, GPU-decodable mesh compression format. One fused CUDA kernel
 decodes upward of **1.8 G triangles per second** on a consumer NVIDIA RTX 3090,
@@ -119,8 +121,21 @@ article in *The Visual Computer* (Springer):
 }
 ```
 
-<!-- TODO: on acceptance, add volume/number/pages/year/DOI; add the Zenodo
-software DOI as a second citation entry. -->
+The source code and datasets are archived on Zenodo (concept DOI, always the
+latest release): [10.5281/zenodo.20942759](https://doi.org/10.5281/zenodo.20942759).
+
+```bibtex
+@software{meshpress_stride,
+  title     = {{MeshPress}: {STRIDE} GPU mesh compression},
+  author    = {Maletskyi, Denys and Vyklyuk, Yaroslav and Li, Fengping},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.20942759},
+  url       = {https://doi.org/10.5281/zenodo.20942759},
+  version   = {1.0.0}
+}
+```
+
+<!-- TODO: on acceptance, add volume/number/pages/year/article DOI. -->
 
 ## License
 
